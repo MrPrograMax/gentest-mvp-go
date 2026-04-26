@@ -13,7 +13,11 @@
 go mod download
 
 # 2. Собрать
+Для Linux/MacOS
 go build -o testgen ./cmd/testgen
+
+Для Windows
+go build -o testgen.exe ./cmd/testgen
 
 # 3. Сгенерировать тесты для примеров
 ./testgen -v ./example/calculator/
