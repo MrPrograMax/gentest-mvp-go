@@ -46,9 +46,10 @@ func Analyze(r *loader.Result) ([]model.FunctionSpec, error) {
 // pkg передаётся для доступа к TypesInfo (type-checker).
 func buildSpec(pkg *packages.Package, pkgPath string, fn *ast.FuncDecl) model.FunctionSpec {
 	spec := model.FunctionSpec{
-		PackageName: pkg.Name,
-		PackagePath: pkgPath,
-		Name:        fn.Name.Name,
+		PackageName:       pkg.Name,
+		PackagePath:       pkgPath,
+		PackageImportPath: pkg.PkgPath,
+		Name:              fn.Name.Name,
 	}
 
 	// ── Получатель (receiver) ─────────────────────────────────────────────────
@@ -61,6 +62,9 @@ func buildSpec(pkg *packages.Package, pkgPath string, fn *ast.FuncDecl) model.Fu
 		} else {
 			spec.ReceiverName = "rcv"
 		}
+		// Извлекаем поля receiver-структуры через go/types.
+		// Нужны mockplan для поиска интерфейс-полей.
+		spec.ReceiverFields = receiverFields(pkg, recv.Type)
 	}
 
 	// ── Параметры ─────────────────────────────────────────────────────────────
@@ -71,23 +75,26 @@ func buildSpec(pkg *packages.Package, pkgPath string, fn *ast.FuncDecl) model.Fu
 			if _, ok := field.Type.(*ast.Ellipsis); ok {
 				spec.IsVariadic = true
 			}
-			typeStr := exprStr(field.Type)
+			ts := exprStr(field.Type)
+			tsFull := qualifiedTypeStr(pkg.TypesInfo, field.Type)
 			kind := classifyExpr(field.Type, pkg.TypesInfo)
 
 			if len(field.Names) == 0 {
 				// Анонимный параметр.
 				spec.Params = append(spec.Params, model.ParamSpec{
-					Name:    fmt.Sprintf("arg%d", idx),
-					TypeStr: typeStr,
-					Kind:    kind,
+					Name:        fmt.Sprintf("arg%d", idx),
+					TypeStr:     ts,
+					TypeStrFull: tsFull,
+					Kind:        kind,
 				})
 				idx++
 			} else {
 				for _, name := range field.Names {
 					spec.Params = append(spec.Params, model.ParamSpec{
-						Name:    name.Name,
-						TypeStr: typeStr,
-						Kind:    kind,
+						Name:        name.Name,
+						TypeStr:     ts,
+						TypeStrFull: tsFull,
+						Kind:        kind,
 					})
 					idx++
 				}
@@ -99,7 +106,8 @@ func buildSpec(pkg *packages.Package, pkgPath string, fn *ast.FuncDecl) model.Fu
 	if fn.Type.Results != nil {
 		idx := 0
 		for _, field := range fn.Type.Results.List {
-			typeStr := exprStr(field.Type)
+			ts := exprStr(field.Type)
+			tsFull := qualifiedTypeStr(pkg.TypesInfo, field.Type)
 			kind := classifyExpr(field.Type, pkg.TypesInfo)
 			isErr := kind == model.KindError
 
@@ -112,10 +120,11 @@ func buildSpec(pkg *packages.Package, pkgPath string, fn *ast.FuncDecl) model.Fu
 			}
 
 			spec.Results = append(spec.Results, model.ParamSpec{
-				Name:    name,
-				TypeStr: typeStr,
-				Kind:    kind,
-				IsError: isErr,
+				Name:        name,
+				TypeStr:     ts,
+				TypeStrFull: tsFull,
+				Kind:        kind,
+				IsError:     isErr,
 			})
 			if isErr {
 				spec.HasError = true
@@ -500,4 +509,93 @@ func funcTypeStr(ft *ast.FuncType) string {
 		s += " (" + strings.Join(results, ", ") + ")"
 	}
 	return s
+}
+
+// ── Извлечение полей receiver-структуры ──────────────────────────────────────
+
+// receiverFields возвращает список полей receiver-структуры с информацией о том,
+// является ли каждое поле интерфейсом. Используется mockplan для поиска
+// интерфейс-зависимостей, которые нужно подменить моками.
+//
+// Алгоритм:
+//  1. Резолвим тип receiver через TypesInfo.
+//  2. Если это указатель на структуру — берём элемент.
+//  3. Если в итоге получили *types.Struct — обходим поля.
+//  4. Для каждого поля проверяем types.Type на принадлежность к интерфейсу.
+//
+// Если тип не структура (например, методы на типе-алиасе) — возвращаем nil.
+func receiverFields(pkg *packages.Package, recvType ast.Expr) []model.ReceiverField {
+	if pkg == nil || pkg.TypesInfo == nil {
+		return nil
+	}
+
+	// Резолвим тип receiver. recvType может быть *ast.Ident (T) или *ast.StarExpr (*T).
+	tv, ok := pkg.TypesInfo.Types[recvType]
+	if !ok || tv.Type == nil {
+		return nil
+	}
+
+	t := tv.Type
+	// Снимаем указатель, если есть.
+	if ptr, ok := t.(*types.Pointer); ok {
+		t = ptr.Elem()
+	}
+
+	// Получаем underlying — структура или нет.
+	named, ok := t.(*types.Named)
+	if !ok {
+		return nil
+	}
+	st, ok := named.Underlying().(*types.Struct)
+	if !ok {
+		return nil
+	}
+
+	out := make([]model.ReceiverField, 0, st.NumFields())
+	for i := 0; i < st.NumFields(); i++ {
+		f := st.Field(i)
+		ft := f.Type()
+
+		// Проверяем, является ли тип поля интерфейсом.
+		// Important: смотрим на underlying — *types.Interface может быть прямым
+		// типом или underlying у *types.Named (для именованных интерфейсов).
+		_, isIface := ft.Underlying().(*types.Interface)
+
+		out = append(out, model.ReceiverField{
+			Name:        f.Name(),
+			TypeStr:     typeStr(ft),
+			IsInterface: isIface,
+		})
+	}
+	return out
+}
+
+// typeStr — строковое представление types.Type для кодогенерации.
+// Использует короткую квалификацию (имя пакета без пути).
+func typeStr(t types.Type) string {
+	return types.TypeString(t, func(p *types.Package) string {
+		if p == nil {
+			return ""
+		}
+		return p.Name()
+	})
+}
+
+// qualifiedTypeStr возвращает полностью квалифицированное представление типа
+// через type-checker. Используется для external test package (_test),
+// где типы из исходного пакета должны быть квалифицированы (service.UserRepository).
+// При недоступности TypesInfo возвращает exprStr (fallback).
+func qualifiedTypeStr(info *types.Info, expr ast.Expr) string {
+	if info == nil {
+		return exprStr(expr)
+	}
+	if tv, ok := info.Types[expr]; ok && tv.Type != nil {
+		return types.TypeString(tv.Type, func(p *types.Package) string {
+			if p == nil {
+				return ""
+			}
+			return p.Name()
+		})
+	}
+	return exprStr(expr)
 }

@@ -4,6 +4,26 @@
 //  1. buildTemplateData — формирует промежуточную структуру из FileSpec.
 //  2. template.Execute  — выполняет встроенный Go-шаблон.
 //  3. format.Source     — применяет go/format для канонического вывода.
+//
+// Режимы моков (FileSpec.MockMode):
+//
+//	MockNone:
+//	  package <name>        — обычный тест в том же пакете.
+//
+//	MockMinimock (при наличии MockPlan):
+//	  package <name>_test   — ВНЕШНИЙ тестовый пакет.
+//	  Причина: mock-пакет (service/mock) импортирует source-пакет (service),
+//	  поэтому тест в package service не может импортировать service/mock —
+//	  возникает import cycle. Внешний _test пакет разрывает цикл:
+//	    service_test → service   (no cycle)
+//	    service_test → service/mock → service  (ok, service_test ≠ service)
+//
+//	  Renderer добавляет:
+//	    import service "pkg/path"       — для вызова service.NewService(...)
+//	    import mock "pkg/path/mock"     — для *mock.UserRepositoryMock
+//	  Struct fields используют TypeStrFull (qualified через go/types).
+//	  Setup: rcv := service.New<Type>(m.fieldName...)
+//	  Call:  rcv.Method(...) или service.Func(...)
 package render
 
 import (
@@ -33,10 +53,27 @@ func RenderFile(fs model.FileSpec) ([]byte, error) {
 
 	src, err := format.Source(buf.Bytes())
 	if err != nil {
-		// Возвращаем неформатированный источник чтобы пользователь мог диагностировать.
 		return buf.Bytes(), fmt.Errorf("render: go/format: %w\n--- неформатированный источник ---\n%s", err, buf.String())
 	}
 	return src, nil
+}
+
+// ── Контекст рендеринга ────────────────────────────────────────────────────────
+
+// renderCtx содержит параметры, влияющие на генерацию всего файла.
+type renderCtx struct {
+	mockMode model.MockMode
+
+	// isExternalTest — true когда тест генерируется в package <pkg>_test.
+	// Активируется при MockMode=minimock и наличии хотя бы одного MockPlan.
+	isExternalTest bool
+
+	// srcPkgName — имя source пакета ("service"). Используется как alias в импорте.
+	srcPkgName string
+
+	// srcPkgImportPath — import path source пакета.
+	// Пример: "github.com/yourorg/testgen/example/service"
+	srcPkgImportPath string
 }
 
 // ── Структуры данных шаблона ──────────────────────────────────────────────────
@@ -45,15 +82,36 @@ type fileData struct {
 	PackageName string
 	Imports     []string
 	Tests       []testData
+
+	// MinimockEnabled — true когда хотя бы один тест в файле имеет MockPlan.HasMocks()
+	// и режим — minimock.
+	MinimockEnabled bool
+	// TestMocks — поля type testMocks struct (объединение моков всех тестов файла).
+	TestMocks []testMockField
+}
+
+// testMockField — одно поле в type testMocks struct.
+// FieldName = имя поля receiver-структуры ("repo").
+// QualifiedType = тип с пакетным префиксом ("mock.UserRepositoryMock").
+// QualifiedConstructor = конструктор с пакетным префиксом ("mock.NewUserRepositoryMock").
+type testMockField struct {
+	FieldName            string
+	QualifiedType        string
+	QualifiedConstructor string
 }
 
 type testData struct {
 	TestFuncName string
 	StructFields []field
 	Rows         []rowData
-	SetupLines   []string // строки перед вызовом (например инициализация ресивера)
-	CallLine     string   // строка с вызовом функции / метода
-	AssertLines  []string // утверждения после вызова
+	SetupLines   []string
+	CallLine     string
+	AssertLines  []string
+
+	// HasMocks — true для метода, у которого MockPlan непустой и режим — minimock.
+	HasMocks bool
+	// Mocks — конкретные моки для этого теста (используются в t.Run setup).
+	Mocks []testMockField
 }
 
 type field struct {
@@ -62,37 +120,73 @@ type field struct {
 }
 
 type rowData struct {
-	Name   string
-	Fields []fieldValue
+	Name        string
+	Fields      []fieldValue
+	PrepareBody string
 }
 
 type fieldValue struct {
 	Name  string
 	Value string
 	// Comment — строка inline-комментария (без // ), или пусто.
-	// render помещает его после запятой: `fieldName: value, // Comment`
-	// go/format сохраняет inline-комментарии без изменений.
 	Comment string
 }
 
 // ── Построение данных шаблона ─────────────────────────────────────────────────
 
 func buildTemplateData(fs model.FileSpec) (fileData, error) {
-	fd := fileData{PackageName: fs.PackageName}
+	// Определяем, нужен ли external test package.
+	ctx := renderCtx{
+		mockMode:         fs.MockMode,
+		srcPkgName:       fs.PackageName,
+		srcPkgImportPath: fs.PackageImportPath,
+	}
+	if fs.MockMode == model.MockMinimock {
+		for _, ts := range fs.Tests {
+			if ts.Func.MockPlan.HasMocks() {
+				ctx.isExternalTest = true
+				break
+			}
+		}
+	}
+
+	pkgName := fs.PackageName
+	if ctx.isExternalTest {
+		pkgName = fs.PackageName + "_test"
+	}
+
+	fd := fileData{PackageName: pkgName}
+	mockSet := map[string]testMockField{}
 
 	for _, ts := range fs.Tests {
-		td, err := buildTestData(ts)
+		td, err := buildTestData(ts, ctx)
 		if err != nil {
 			return fd, err
 		}
 		fd.Tests = append(fd.Tests, td)
+
+		for _, m := range td.Mocks {
+			if _, ok := mockSet[m.FieldName]; !ok {
+				mockSet[m.FieldName] = m
+			}
+		}
 	}
 
-	fd.Imports = planImports(fs)
+	if fs.MockMode == model.MockMinimock && len(mockSet) > 0 {
+		fd.MinimockEnabled = true
+		for _, m := range mockSet {
+			fd.TestMocks = append(fd.TestMocks, m)
+		}
+		sort.Slice(fd.TestMocks, func(i, j int) bool {
+			return fd.TestMocks[i].FieldName < fd.TestMocks[j].FieldName
+		})
+	}
+
+	fd.Imports = planImports(fs, ctx)
 	return fd, nil
 }
 
-func buildTestData(ts model.TestSpec) (testData, error) {
+func buildTestData(ts model.TestSpec, ctx renderCtx) (testData, error) {
 	fn := ts.Func
 	td := testData{
 		TestFuncName: "Test" + fn.Name,
@@ -101,24 +195,46 @@ func buildTestData(ts model.TestSpec) (testData, error) {
 		td.TestFuncName = "Test" + titleCase(fn.ReceiverType) + "_" + fn.Name
 	}
 
+	// Решаем, активен ли minimock-режим для этой функции.
+	td.HasMocks = ctx.mockMode == model.MockMinimock && fn.MockPlan.HasMocks()
+	if td.HasMocks {
+		td.Mocks = make([]testMockField, 0, len(fn.MockPlan.Mocks))
+		for _, m := range fn.MockPlan.Mocks {
+			pkg := m.MockPackage
+			if pkg == "" {
+				pkg = "mock"
+			}
+			td.Mocks = append(td.Mocks, testMockField{
+				FieldName:            m.FieldName,
+				QualifiedType:        pkg + "." + m.MockType,    // "mock.UserRepositoryMock"
+				QualifiedConstructor: pkg + "." + m.Constructor, // "mock.NewUserRepositoryMock"
+			})
+		}
+	}
+
 	// ── Поля struct ───────────────────────────────────────────────────────────
 	for i, p := range fn.Params {
 		name := inputFieldName(p.Name, i)
-		// Analyzer уже возвращает "[]T" для вариадических параметров,
-		// поэтому дополнительных преобразований не нужно.
-		td.StructFields = append(td.StructFields, field{Name: name, TypeStr: p.TypeStr})
+		// В external test package используем TypeStrFull (qualified через type-checker).
+		// Это позволяет правильно квалифицировать типы из source пакета:
+		// "UserRepository" → "service.UserRepository"
+		ts := p.TypeStr
+		if ctx.isExternalTest && p.TypeStrFull != "" {
+			ts = p.TypeStrFull
+		}
+		td.StructFields = append(td.StructFields, field{Name: name, TypeStr: ts})
 	}
-
-	// MVP-решение: want*-поля для не-error результатов НЕ генерируются.
-	// Причина: testgen не умеет надёжно вывести ожидаемые значения из сигнатуры
-	// функции (только пользователь знает её бизнес-логику). Раньше мы вставляли
-	// placeholder-значения (42, "test-value", []string{"test-value"}) и сравнивали
-	// их через reflect.DeepEqual — но это давало заведомо падающие тесты.
-	// Теперь для не-error результатов в assert-секции генерируется
-	// `_ = gotN // TODO: verify ...` — пользователь сам подставляет проверку.
 
 	if fn.HasError {
 		td.StructFields = append(td.StructFields, field{Name: "wantErr", TypeStr: "bool"})
+	}
+
+	// prepare-поле — только в minimock-режиме с непустым MockPlan.
+	if td.HasMocks {
+		td.StructFields = append(td.StructFields, field{
+			Name:    "prepare",
+			TypeStr: "func(m *testMocks)",
+		})
 	}
 
 	// ── Строки таблицы ────────────────────────────────────────────────────────
@@ -127,17 +243,12 @@ func buildTestData(ts model.TestSpec) (testData, error) {
 
 		for i, fv := range sc.Inputs {
 			fieldName := inputFieldName(fn.Params[i].Name, i)
-			// Если фикстура помечена NeedsMockComment (interface-тип),
-			// прикрепляем TODO-комментарий, видимый пользователю в сгенерированном файле.
-			// Это место зарезервировано для будущей интеграции с mockplan:
-			// когда mockplan начнёт генерировать stub-код, комментарий заменится на него.
 			comment := ""
 			if fv.NeedsMockComment {
 				comment = "TODO: подставь mock/stub для " + fn.Params[i].TypeStr
 			}
 			row.Fields = append(row.Fields, fieldValue{Name: fieldName, Value: fv.Expr, Comment: comment})
 		}
-		// sc.Wants намеренно не записываются: want*-поля не генерируются (см. выше).
 		if fn.HasError {
 			errVal := "false"
 			if sc.WantError {
@@ -145,19 +256,21 @@ func buildTestData(ts model.TestSpec) (testData, error) {
 			}
 			row.Fields = append(row.Fields, fieldValue{Name: "wantErr", Value: errVal})
 		}
+		if td.HasMocks {
+			row.PrepareBody = "// TODO: configure minimock expectations for this scenario"
+			row.Fields = append(row.Fields, fieldValue{
+				Name:  "prepare",
+				Value: fmt.Sprintf("func(m *testMocks) {\n\t\t\t\t%s\n\t\t\t}", row.PrepareBody),
+			})
+		}
 		td.Rows = append(td.Rows, row)
 	}
 
 	// ── Setup-строки ──────────────────────────────────────────────────────────
-	if fn.IsMethod {
-		rcvType := strings.TrimPrefix(fn.ReceiverType, "*")
-		td.SetupLines = append(td.SetupLines,
-			fmt.Sprintf("rcv := &%s{} // TODO: инициализируй ресивер правильно", rcvType),
-		)
-	}
+	td.SetupLines = buildSetupLines(fn, td.HasMocks, ctx)
 
 	// ── Строка вызова ─────────────────────────────────────────────────────────
-	td.CallLine = buildCallLine(fn)
+	td.CallLine = buildCallLine(fn, ctx)
 
 	// ── Строки утверждений ────────────────────────────────────────────────────
 	td.AssertLines = buildAssertLines(fn)
@@ -165,8 +278,88 @@ func buildTestData(ts model.TestSpec) (testData, error) {
 	return td, nil
 }
 
-func buildCallLine(fn model.FunctionSpec) string {
-	// Формируем список переменных результата: got0, got1, ..., err
+// buildSetupLines формирует строки, выполняемые внутри t.Run перед вызовом.
+//
+// Без моков, internal package:
+//
+//	rcv := &Service{} // TODO
+//
+// Без моков, external package:
+//
+//	rcv := &service.Service{} // TODO
+//
+// С моками, external package (minimock):
+//
+//	mc := minimock.NewController(t)
+//	m := &testMocks{repo: mock.NewUserRepositoryMock(mc)}
+//	if tt.prepare != nil { tt.prepare(m) }
+//	rcv := service.NewService(m.repo)
+func buildSetupLines(fn model.FunctionSpec, hasMocks bool, ctx renderCtx) []string {
+	if !fn.IsMethod {
+		return nil
+	}
+	rcvType := strings.TrimPrefix(fn.ReceiverType, "*") // "Service"
+
+	if !hasMocks {
+		// Без моков: простая инициализация с TODO.
+		if ctx.isExternalTest {
+			return []string{
+				fmt.Sprintf("rcv := &%s.%s{} // TODO: инициализируй ресивер правильно", ctx.srcPkgName, rcvType),
+			}
+		}
+		return []string{
+			fmt.Sprintf("rcv := &%s{} // TODO: инициализируй ресивер правильно", rcvType),
+		}
+	}
+
+	// Режим minimock: контроллер → моки → prepare → receiver через конструктор.
+	lines := []string{
+		"mc := minimock.NewController(t)",
+		"m := &testMocks{",
+	}
+	for _, mock := range fn.MockPlan.Mocks {
+		pkg := mock.MockPackage
+		if pkg == "" {
+			pkg = "mock"
+		}
+		qualCtor := pkg + "." + mock.Constructor
+		lines = append(lines, fmt.Sprintf("\t%s: %s(mc),", mock.FieldName, qualCtor))
+	}
+	lines = append(lines, "}")
+	lines = append(lines,
+		"if tt.prepare != nil {",
+		"\ttt.prepare(m)",
+		"}",
+	)
+
+	// Инициализируем receiver.
+	// External package: используем constructor-конвенцию service.NewService(m.repo).
+	// Аргументы — поля MockPlan в порядке их появления в ReceiverFields.
+	// Это правильно для стандартной DI-конвенции func NewType(dep1, dep2 ...).
+	if ctx.isExternalTest {
+		ctorName := "New" + rcvType // "NewService"
+		var args []string
+		for _, m := range fn.MockPlan.Mocks {
+			args = append(args, "m."+m.FieldName)
+		}
+		rcvLine := fmt.Sprintf("rcv := %s.%s(%s)", ctx.srcPkgName, ctorName, strings.Join(args, ", "))
+		lines = append(lines, rcvLine)
+	} else {
+		// Internal package: composite literal с mock-полями.
+		var rcvParts []string
+		for _, mock := range fn.MockPlan.Mocks {
+			rcvParts = append(rcvParts, fmt.Sprintf("%s: m.%s", mock.FieldName, mock.FieldName))
+		}
+		rcvLine := fmt.Sprintf("rcv := &%s{%s}", rcvType, strings.Join(rcvParts, ", "))
+		lines = append(lines, rcvLine)
+	}
+
+	return lines
+}
+
+// buildCallLine формирует строку вызова тестируемой функции/метода.
+// В external test package функции квалифицируются алиасом source пакета.
+func buildCallLine(fn model.FunctionSpec, ctx renderCtx) string {
 	var lhs []string
 	gotIdx := 0
 	for _, r := range fn.Results {
@@ -178,7 +371,6 @@ func buildCallLine(fn model.FunctionSpec) string {
 		}
 	}
 
-	// Формируем список аргументов
 	var args []string
 	for i, p := range fn.Params {
 		argName := fmt.Sprintf("tt.%s", inputFieldName(p.Name, i))
@@ -190,7 +382,11 @@ func buildCallLine(fn model.FunctionSpec) string {
 
 	var callExpr string
 	if fn.IsMethod {
+		// Метод: rcv.Method(...) — qualifier не нужен, rcv уже нужного типа.
 		callExpr = fmt.Sprintf("rcv.%s(%s)", fn.Name, strings.Join(args, ", "))
+	} else if ctx.isExternalTest {
+		// Функция в external package: нужен qualifier.
+		callExpr = fmt.Sprintf("%s.%s(%s)", ctx.srcPkgName, fn.Name, strings.Join(args, ", "))
 	} else {
 		callExpr = fmt.Sprintf("%s(%s)", fn.Name, strings.Join(args, ", "))
 	}
@@ -204,7 +400,6 @@ func buildCallLine(fn model.FunctionSpec) string {
 func buildAssertLines(fn model.FunctionSpec) []string {
 	var lines []string
 
-	// Проверка ошибки — реальная: генератор знает что значит wantErr=true/false.
 	if fn.HasError {
 		lines = append(lines,
 			"if (err != nil) != tt.wantErr {",
@@ -216,12 +411,6 @@ func buildAssertLines(fn model.FunctionSpec) []string {
 		)
 	}
 
-	// Проверка не-error результатов — НЕ автоматическая.
-	// Раньше здесь был reflect.DeepEqual(got, want), но want — placeholder,
-	// который генератор не может надёжно вывести → тесты заведомо падали.
-	// Сейчас: для каждого got* выдаём `_ = gotN` (чтобы переменная считалась
-	// использованной) и TODO-комментарий — пользователь сам впишет проверку,
-	// когда определит ожидаемое поведение функции.
 	gotIdx := 0
 	for _, r := range fn.Results {
 		if r.IsError {
@@ -238,7 +427,6 @@ func buildAssertLines(fn model.FunctionSpec) []string {
 
 // ── Вспомогательные функции ───────────────────────────────────────────────────
 
-// titleCase приводит первый символ к верхнему регистру и убирает ведущий *.
 func titleCase(s string) string {
 	s = strings.TrimPrefix(s, "*")
 	if s == "" {
@@ -251,20 +439,15 @@ func inputFieldName(paramName string, idx int) string {
 	if paramName == "" || paramName == "_" {
 		return fmt.Sprintf("input%d", idx)
 	}
-	// Первая буква в верхнем регистре: "a" → "inputA"
 	return "input" + strings.ToUpper(paramName[:1]) + paramName[1:]
 }
 
 // ── Import planner ────────────────────────────────────────────────────────────
 
-// typeImportTable — таблица «подстрока TypeStr → путь импорта».
-// Порядок важен: более специфичные записи должны идти раньше общих.
-// Расширяй список при добавлении новых пакетов.
 var typeImportTable = []struct {
-	prefix string // подстрока, которую ищем в TypeStr
-	path   string // путь импорта в кавычках
+	prefix string
+	path   string
 }{
-	// Стандартная библиотека, обычно встречающаяся в сигнатурах функций:
 	{"context.", `"context"`},
 	{"io.", `"io"`},
 	{"sql.", `"database/sql"`},
@@ -272,9 +455,6 @@ var typeImportTable = []struct {
 	{"time.", `"time"`},
 }
 
-// exprImportTable — таблица «подстрока Expr → путь импорта».
-// Нужна отдельно от typeImportTable: Expr и TypeStr могут требовать разных пакетов.
-// Пример: TypeStr="io.Reader" → import "io", Expr="strings.NewReader(...)" → import "strings".
 var exprImportTable = []struct {
 	prefix string
 	path   string
@@ -284,28 +464,33 @@ var exprImportTable = []struct {
 	{"time.", `"time"`},
 }
 
-// planImports возвращает отсортированный список строк импортов для сгенерированного файла.
+// planImports возвращает отсортированный список строк импортов.
 //
-// Алгоритм:
-//  1. Всегда добавляет "testing".
-//  2. Сканирует TypeStr параметров и результатов через typeImportTable.
-//  3. Сканирует Expr фикстур через exprImportTable (например strings.NewReader → "strings").
-//  4. Проверяет фикстуры на time-выражения через NeedsTimeImport.
+// В режиме MockMinimock + external test package:
+//   - добавляется import "github.com/gojuno/minimock/v3"
+//   - добавляется import с алиасом source пакета: service "pkg/path"
+//   - добавляется import с алиасом mock пакета: mock "pkg/path/mock"
 //
-// reflect не нужен: assert не использует reflect.DeepEqual в MVP
-// (см. комментарий в buildAssertLines).
-//
-// Итоговый список дедуплицируется и сортируется по алфавиту.
-func planImports(fs model.FileSpec) []string {
+// Поля TypeStr сканируются в TypeStrFull-форме (qualified), чтобы добраться
+// до нужных пакетов, даже когда TypeStr содержит только короткое имя.
+func planImports(fs model.FileSpec, ctx renderCtx) []string {
 	needed := map[string]bool{
 		`"testing"`: true,
 	}
 
+	hasMinimock := false
+
 	for _, ts := range fs.Tests {
-		// Сканируем TypeStr параметров и результатов.
+		// Сканируем TypeStr (и TypeStrFull) параметров и результатов.
 		for _, p := range ts.Func.Params {
 			for _, imp := range importsForType(p.TypeStr) {
 				needed[imp] = true
+			}
+			// TypeStrFull может содержать квалифицированные типы из внешних пакетов.
+			if p.TypeStrFull != "" && p.TypeStrFull != p.TypeStr {
+				for _, imp := range importsForType(p.TypeStrFull) {
+					needed[imp] = true
+				}
 			}
 		}
 		for _, r := range ts.Func.Results {
@@ -314,9 +499,6 @@ func planImports(fs model.FileSpec) []string {
 			}
 		}
 
-		// Сканируем Expr всех фикстур: они могут ссылаться на пакеты,
-		// отличные от тех что видны в TypeStr.
-		// Пример: TypeStr="io.Reader" → "io", Expr="strings.NewReader(...)" → "strings".
 		for _, sc := range ts.Scenarios {
 			for _, fv := range sc.Inputs {
 				for _, imp := range importsForExpr(fv.Expr) {
@@ -328,10 +510,32 @@ func planImports(fs model.FileSpec) []string {
 					needed[imp] = true
 				}
 			}
-			// Фикстуры: time нужен если используются time-выражения.
 			if fixture.NeedsTimeImport(sc.Inputs...) || fixture.NeedsTimeImport(sc.Wants...) {
 				needed[`"time"`] = true
 			}
+		}
+
+		if fs.MockMode == model.MockMinimock && ts.Func.MockPlan.HasMocks() {
+			hasMinimock = true
+			for _, m := range ts.Func.MockPlan.Mocks {
+				if m.MockImportPath != "" {
+					if ctx.isExternalTest {
+						// Используем явный alias совпадающий с именем пакета (mock).
+						// Это нужно чтобы не конфликтовать с другими imports.
+						needed[m.MockPackage+` "`+m.MockImportPath+`"`] = true
+					} else {
+						needed[`"`+m.MockImportPath+`"`] = true
+					}
+				}
+			}
+		}
+	}
+
+	if hasMinimock {
+		needed[`"github.com/gojuno/minimock/v3"`] = true
+		// В external test package добавляем import source пакета с алиасом.
+		if ctx.isExternalTest && ctx.srcPkgImportPath != "" {
+			needed[ctx.srcPkgName+` "`+ctx.srcPkgImportPath+`"`] = true
 		}
 	}
 
@@ -343,14 +547,6 @@ func planImports(fs model.FileSpec) []string {
 	return imports
 }
 
-// importsForType возвращает список импортов, необходимых для typeStr.
-// Проверяет наличие подстроки-префикса через typeImportTable.
-// Использует strings.Contains, чтобы корректно обрабатывать составные типы:
-//
-//	*context.Context        → "context"
-//	[]io.Reader             → "io"
-//	map[string]sql.NullStr  → "database/sql"
-//	func(context.Context)   → "context"
 func importsForType(typeStr string) []string {
 	var result []string
 	for _, entry := range typeImportTable {
@@ -361,9 +557,6 @@ func importsForType(typeStr string) []string {
 	return result
 }
 
-// importsForExpr возвращает список импортов, необходимых для Go-выражения expr.
-// Используется для сканирования fixture.Expr, чтобы выявить пакеты,
-// явно используемые в значениях (например strings.NewReader, context.Background).
 func importsForExpr(expr string) []string {
 	var result []string
 	for _, entry := range exprImportTable {
@@ -384,10 +577,23 @@ import (
 	{{.}}
 {{- end}}
 )
+{{if .MinimockEnabled}}
+// testMocks объединяет все мок-объекты, используемые в тестах файла.
+// Каждое поле инициализируется через minimock.NewController в t.Run.
+type testMocks struct {
+{{- range .TestMocks}}
+	{{.FieldName}} *{{.QualifiedType}}
+{{- end}}
+}
+{{end}}
 {{range .Tests}}
 // {{.TestFuncName}} сгенерирован testgen.
 // TODO: дополни проверки got* в соответствии с бизнес-логикой
 // (см. строки '_ = gotN' ниже — там стоят TODO-комментарии).
+{{- if .HasMocks}}
+// Для каждой строки таблицы реализуй prepare(m *testMocks):
+// настрой ожидания минимок-моков, например m.<fieldName>.<Method>Mock.Expect(...).Return(...).
+{{- end}}
 func {{.TestFuncName}}(t *testing.T) {
 	tests := []struct {
 		name string

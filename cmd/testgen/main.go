@@ -8,9 +8,10 @@
 //
 // Флаги:
 //
-//	-o string     записать вывод в этот файл (по умолчанию выводится из <путь>)
-//	-validate     скомпилировать вывод через `go test -run ^$ .` после записи
-//	-v            подробное логирование
+//	-o string         записать вывод в этот файл (по умолчанию выводится из <путь>)
+//	-validate         скомпилировать вывод через `go test -run ^$ .` после записи
+//	-v                подробное логирование
+//	--mock=MODE       стратегия моков для методов структур: none|minimock (по умолчанию none)
 package main
 
 import (
@@ -21,6 +22,7 @@ import (
 	"os"
 
 	"github.com/yourorg/testgen/internal/app"
+	"github.com/yourorg/testgen/internal/model"
 )
 
 func main() {
@@ -28,6 +30,7 @@ func main() {
 		outputFile    = flag.String("o", "", "путь к выходному файлу (по умолчанию выводится из target)")
 		runValidation = flag.Bool("validate", false, "запустить `go test -run ^$ .` для проверки компиляции")
 		verbose       = flag.Bool("v", false, "подробное логирование")
+		mockMode      = flag.String("mock", "none", "стратегия моков: none|minimock")
 	)
 	flag.Usage = func() {
 		fmt.Fprintln(os.Stderr, "Использование: testgen [флаги] <директория-пакета|файл.go>")
@@ -37,6 +40,18 @@ func main() {
 
 	if flag.NArg() != 1 {
 		flag.Usage()
+		os.Exit(1)
+	}
+
+	// Валидируем значение --mock.
+	var mode model.MockMode
+	switch *mockMode {
+	case "none", "":
+		mode = model.MockNone
+	case "minimock":
+		mode = model.MockMinimock
+	default:
+		fmt.Fprintf(os.Stderr, "testgen: неизвестное значение --mock=%q (допустимо: none|minimock)\n", *mockMode)
 		os.Exit(1)
 	}
 
@@ -53,6 +68,7 @@ func main() {
 		Target:        target,
 		OutputFile:    *outputFile,
 		RunValidation: *runValidation,
+		MockMode:      mode,
 		Logger:        logger,
 	}
 

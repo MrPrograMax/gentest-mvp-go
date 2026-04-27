@@ -23,10 +23,16 @@ const (
 
 // ParamSpec описывает один параметр функции или возвращаемое значение.
 type ParamSpec struct {
-	Name    string   // идентификатор (генерируется автоматически если анонимный)
-	TypeStr string   // строковое представление типа, например "[]string", "*MyType"
-	Kind    TypeKind // классификация для выбора фикстуры
-	IsError bool     // true когда тип является встроенным интерфейсом error
+	Name    string // идентификатор (генерируется автоматически если анонимный)
+	TypeStr string // короткое представление типа (без пакета для same-pkg типов)
+	// TypeStrFull — полностью квалифицированное представление типа через type-checker.
+	// Для типов из того же пакета добавляет квалификатор:
+	// "UserRepository" → "service.UserRepository"
+	// Используется в external test package (_test) чтобы типы были в scope.
+	// Пустая строка означает что type-checker не предоставил информацию.
+	TypeStrFull string
+	Kind        TypeKind // классификация для выбора фикстуры
+	IsError     bool     // true когда тип является встроенным интерфейсом error
 }
 
 // Guards содержит факты статического анализа тела функции.
@@ -51,18 +57,89 @@ type Guards struct {
 
 // FunctionSpec — внутреннее представление экспортируемой функции или метода.
 type FunctionSpec struct {
-	PackageName  string
-	PackagePath  string // директория, содержащая пакет
-	Name         string
-	ReceiverName string // например "s" — пусто для обычных функций
-	ReceiverType string // например "*Service" — пусто для обычных функций
-	IsMethod     bool
-	IsVariadic   bool
-	Params       []ParamSpec
-	Results      []ParamSpec
-	HasError     bool   // true когда последний результат имеет тип error
-	Guards       Guards // факты анализа тела функции
+	PackageName       string
+	PackagePath       string // абсолютная директория пакета
+	PackageImportPath string // полный import path, например "github.com/yourorg/testgen/example/service"
+	Name              string
+	ReceiverName      string // например "s" — пусто для обычных функций
+	ReceiverType      string // например "*Service" — пусто для обычных функций
+	IsMethod          bool
+	IsVariadic        bool
+	Params            []ParamSpec
+	Results           []ParamSpec
+	HasError          bool   // true когда последний результат имеет тип error
+	Guards            Guards // факты анализа тела функции
+
+	// ReceiverFields — поля receiver-структуры (только для методов).
+	// Используется mockplan для поиска интерфейс-зависимостей,
+	// которые нужно подменить моками в сгенерированном тесте.
+	ReceiverFields []ReceiverField
+
+	// MockPlan — план мокирования для этой функции.
+	// Заполняется mockplan.Analyze когда MockMode != none.
+	// Пустой план (нет интерфейс-полей) означает что моки не нужны.
+	MockPlan MockPlan
 }
+
+// ReceiverField описывает одно поле receiver-структуры.
+// Например для `type Service struct { repo UserRepository }`
+// будет ReceiverField{Name: "repo", TypeStr: "UserRepository", IsInterface: true}.
+type ReceiverField struct {
+	Name        string // имя поля как в исходном коде
+	TypeStr     string // строковое представление типа
+	IsInterface bool   // true если это интерфейс (кандидат на мокирование)
+}
+
+// MockSpec описывает один мок, необходимый для теста метода.
+//
+// Поля идентификации:
+//   - FieldName — имя поля receiver-структуры ("repo")
+//   - InterfaceName — короткое имя интерфейса без пакета ("UserRepository")
+//   - MockType — имя генерируемого типа без пакета ("UserRepositoryMock")
+//   - Constructor — конструктор без пакета ("NewUserRepositoryMock")
+//
+// Поля размещения (вычисляются mockplan, используются mockgen и render):
+//   - SourceInterfacePath — полный путь интерфейса для minimock -i
+//     ("github.com/yourorg/testgen/example/service.UserRepository")
+//   - MockPackage — имя пакета моков ("mock")
+//   - MockImportPath — import path пакета моков
+//     ("github.com/yourorg/testgen/example/service/mock")
+//   - PackageDir — абсолютный путь директории исходного пакета
+//     (используется как cmd.Dir при запуске minimock)
+//   - MockDir — абсолютный путь к директории моков (<PackageDir>/mock)
+//   - MockFileName — имя файла в snake_case ("user_repository_mock.go")
+//   - MockFilePath — абсолютный путь к файлу мока (для os.Stat/проверок)
+type MockSpec struct {
+	FieldName     string
+	InterfaceName string
+	MockType      string
+	Constructor   string
+
+	SourceInterfacePath string
+	MockPackage         string
+	MockImportPath      string
+	PackageDir          string
+	MockDir             string
+	MockFileName        string
+	MockFilePath        string
+}
+
+// MockPlan — список моков для одного метода.
+// HasMocks() возвращает true если есть хотя бы один мок-кандидат.
+type MockPlan struct {
+	Mocks []MockSpec
+}
+
+// HasMocks возвращает true если план непустой.
+func (p MockPlan) HasMocks() bool { return len(p.Mocks) > 0 }
+
+// MockMode задаёт стратегию подготовки моков.
+type MockMode string
+
+const (
+	MockNone     MockMode = "none"     // моки не генерируются
+	MockMinimock MockMode = "minimock" // используется gojuno/minimock
+)
 
 // ScenarioKind обозначает назначение тестового сценария.
 type ScenarioKind string
@@ -104,7 +181,13 @@ type TestSpec struct {
 
 // FileSpec — верхнеуровневый объект для рендеринга *_test.go файла.
 type FileSpec struct {
-	PackageName string
-	SourceDir   string
-	Tests       []TestSpec
+	PackageName       string
+	PackageImportPath string // полный import path, например "github.com/yourorg/testgen/example/service"
+	SourceDir         string
+	Tests             []TestSpec
+
+	// MockMode определяет, какую minimock-инфраструктуру включит render.
+	// MockNone — никаких моков (поведение по умолчанию для обратной совместимости).
+	// MockMinimock — external test package (_test) + auto import source+mock пакетов.
+	MockMode MockMode
 }

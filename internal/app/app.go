@@ -20,6 +20,7 @@ import (
 
 	"github.com/yourorg/testgen/internal/analyzer"
 	"github.com/yourorg/testgen/internal/loader"
+	"github.com/yourorg/testgen/internal/mockgen"
 	"github.com/yourorg/testgen/internal/mockplan"
 	"github.com/yourorg/testgen/internal/model"
 	"github.com/yourorg/testgen/internal/render"
@@ -39,6 +40,11 @@ type Config struct {
 	// RunValidation — запускать ли `go test -run ^$ .` после записи.
 	RunValidation bool
 
+	// MockMode задаёт стратегию подготовки моков для методов структур.
+	// MockNone — никаких моков (по умолчанию).
+	// MockMinimock — render готовит инфраструктуру под gojuno/minimock.
+	MockMode model.MockMode
+
 	// Logger — получает сообщения о прогрессе и предупреждения.
 	Logger *log.Logger
 }
@@ -47,6 +53,9 @@ type Config struct {
 func Run(cfg Config) error {
 	if cfg.Logger == nil {
 		cfg.Logger = log.New(os.Stderr, "[testgen] ", 0)
+	}
+	if cfg.MockMode == "" {
+		cfg.MockMode = model.MockNone
 	}
 
 	// 1. Загрузка
@@ -68,9 +77,11 @@ func Run(cfg Config) error {
 
 	// 3. Формируем TestSpec
 	var tests []model.TestSpec
-	for _, fn := range specs {
-		// a. Mock plan (только диагностика — мок-код не генерируется)
-		plan := mockplan.Analyze(fn)
+	for i := range specs {
+		fn := &specs[i]
+
+		// a. Legacy: диагностика interface-параметров (только при -v).
+		plan := mockplan.Analyze(*fn)
 		if plan.HasMocks() {
 			for _, e := range plan.Entries {
 				cfg.Logger.Printf("  %s: параметр %q (%s) — интерфейс: %s",
@@ -78,27 +89,58 @@ func Run(cfg Config) error {
 			}
 		}
 
+		// a'. Новый mockplan: для методов с интерфейс-полями receiver-структуры.
+		// Заполняем только когда MockMode != none — иначе зашумлять FunctionSpec не нужно.
+		if cfg.MockMode == model.MockMinimock {
+			fn.MockPlan = mockplan.AnalyzeReceiver(*fn)
+			if fn.MockPlan.HasMocks() {
+				for _, m := range fn.MockPlan.Mocks {
+					cfg.Logger.Printf("  %s: receiver-поле %q (%s) → mock %s",
+						fn.Name, m.FieldName, m.InterfaceName, m.MockType)
+				}
+			}
+		}
+
 		// b. Сценарии
-		scenarios := scenario.Generate(fn)
+		scenarios := scenario.Generate(*fn)
 		tests = append(tests, model.TestSpec{
-			Func:      fn,
+			Func:      *fn,
 			Scenarios: scenarios,
 		})
 	}
 
 	// Определяем имя пакета для сгенерированного файла.
-	// PrimaryPackage теперь возвращает (*packages.Package, bool).
 	pkg, ok := loaded.PrimaryPackage()
 	pkgName := "main"
 	if ok && pkg.Name != "" {
 		pkgName = pkg.Name
 	}
 
+	// 3.5. Генерируем mock-файлы (только при MockMinimock).
+	// Запускается ПОСЛЕ построения всех MockPlan, ДО рендеринга тестов.
+	// Моки размещаются в поддиректории mock/ анализируемого пакета.
+	if cfg.MockMode == model.MockMinimock {
+		generated := map[string]bool{} // ключ = MockFilePath, чтобы не дублировать
+		for _, ts := range tests {
+			for _, m := range ts.Func.MockPlan.Mocks {
+				if m.MockFilePath == "" || generated[m.MockFilePath] {
+					continue
+				}
+				generated[m.MockFilePath] = true
+				if err := mockgen.Generate(m, cfg.Logger); err != nil {
+					return fmt.Errorf("mockgen: %w", err)
+				}
+			}
+		}
+	}
+
 	// 4. Рендеринг
 	fs := model.FileSpec{
-		PackageName: pkgName,
-		SourceDir:   loaded.Dir,
-		Tests:       tests,
+		PackageName:       pkgName,
+		PackageImportPath: pkg.PkgPath,
+		SourceDir:         loaded.Dir,
+		Tests:             tests,
+		MockMode:          cfg.MockMode,
 	}
 
 	src, err := render.RenderFile(fs)
