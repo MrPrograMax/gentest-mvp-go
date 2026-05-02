@@ -19,6 +19,7 @@ import (
 	"strings"
 
 	"github.com/yourorg/testgen/internal/analyzer"
+	"github.com/yourorg/testgen/internal/fixture"
 	"github.com/yourorg/testgen/internal/loader"
 	"github.com/yourorg/testgen/internal/mockgen"
 	"github.com/yourorg/testgen/internal/mockplan"
@@ -45,6 +46,11 @@ type Config struct {
 	// MockMinimock — render готовит инфраструктуру под gojuno/minimock.
 	MockMode model.MockMode
 
+	// FixtureMode задаёт стратегию генерации тестовых фикстур.
+	// FixtureHeuristic — детерминированные правила (по умолчанию).
+	// FixtureLLM / FixtureHybrid — не реализованы, вернут ошибку.
+	FixtureMode model.FixtureMode
+
 	// Logger — получает сообщения о прогрессе и предупреждения.
 	Logger *log.Logger
 }
@@ -57,6 +63,22 @@ func Run(cfg Config) error {
 	if cfg.MockMode == "" {
 		cfg.MockMode = model.MockNone
 	}
+	if cfg.FixtureMode == "" {
+		cfg.FixtureMode = model.FixtureHeuristic
+	}
+
+	// Проверяем fixture mode сразу: fail-fast до любой дорогостоящей работы.
+	// Для llm/hybrid возвращаем ошибку "not implemented" — пользователь получит
+	// понятное сообщение, а не упадёт где-то в середине пайплайна.
+	//
+	// TODO: pass selected fixture.Provider into scenario/fixture planning
+	// when llm/hybrid modes are implemented.
+	// Сейчас NewProvider вызывается только для валидации; heuristic-поведение
+	// обеспечивается пакетными функциями fixture.Happy/Zero/Empty напрямую.
+	if _, err := fixture.NewProvider(cfg.FixtureMode); err != nil {
+		return fmt.Errorf("fixture mode %q: %w", cfg.FixtureMode, err)
+	}
+	cfg.Logger.Printf("fixture mode: %s", cfg.FixtureMode)
 
 	// 1. Загрузка
 	cfg.Logger.Printf("загружаем %s", cfg.Target)

@@ -141,6 +141,27 @@ const (
 	MockMinimock MockMode = "minimock" // используется gojuno/minimock
 )
 
+// FixtureMode задаёт стратегию генерации тестовых фикстур.
+//
+// На данный момент реализован только FixtureHeuristic.
+// FixtureLLM и FixtureHybrid зарезервированы архитектурно —
+// они возвращают ошибку "not implemented" до подключения LLM API.
+type FixtureMode string
+
+const (
+	// FixtureHeuristic — текущая реализация: детерминированные правила
+	// (42 для int, "test-value" для string, new(T) для указателей и т.д.).
+	FixtureHeuristic FixtureMode = "heuristic"
+
+	// FixtureLLM — генерация фикстур через LLM API.
+	// Не реализован: возвращает ошибку "llm fixture provider is not implemented".
+	FixtureLLM FixtureMode = "llm"
+
+	// FixtureHybrid — эвристика + LLM для неизвестных типов.
+	// Не реализован: возвращает ошибку "hybrid fixture provider is not implemented".
+	FixtureHybrid FixtureMode = "hybrid"
+)
+
 // ScenarioKind обозначает назначение тестового сценария.
 type ScenarioKind string
 

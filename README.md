@@ -1,232 +1,302 @@
-# gentest-mvp-go
+# testgen — генератор unit-тестов для Go
 
-MVP-инструмент для генерации компилируемых scaffold unit-тестов для Go-кода.
+`testgen` анализирует экспортируемый Go-пакет и генерирует table-driven `*_test.go`
+со сценариями success / error / edge.
 
-Инструмент анализирует Go-пакет, извлекает экспортируемые функции и методы, строит базовые сценарии выполнения, подбирает входные данные, генерирует `table-driven` тесты и проверяет, что результат компилируется.
-
----
-
-## Что делает
-
-- загружает Go-пакет через `go/packages`;
-- анализирует функции и методы через `go/types` и AST;
-- строит сценарии `success`, `error`, `edge_nil_*`, `edge_empty_*`;
-- генерирует `table-driven` тесты;
-- подбирает базовые фикстуры для типовых Go-типов;
-- добавляет нужные импорты;
-- форматирует сгенерированный код;
-- валидирует компиляцию через `go test -run ^$ .`;
-- поддерживает Minimock и генерирует моки в отдельную папку `mock/`.
+Сгенерированный файл компилируется сразу. Для не-error результатов генерируется
+`_ = gotN // TODO: verify gotN with business-specific expected value` —
+пользователь сам добавляет конкретные проверки, зная бизнес-логику функции.
 
 ---
 
 ## Быстрый старт
 
-Установить зависимости и проверить проект:
-
 ```bash
-go mod tidy
-go test ./...
-```
+# 1. Загрузить зависимости
+go mod download
 
-Сгенерировать тесты для простого demo-пакета:
+# 2. Собрать
+go build -o testgen ./cmd/testgen          # Linux/macOS
+go build -o testgen.exe ./cmd/testgen      # Windows
 
-```bash
-go run ./cmd/testgen -validate ./example/calculator
-```
+# 3. Сгенерировать тесты для примеров
+./testgen -v ./example/calculator/
+./testgen -v ./example/advanced/
 
-Сгенерировать тесты для demo-пакета с `context.Context`, `io.Reader`, pointers и slices:
+# 4. Проверить компиляцию сгенерированного файла
+./testgen -validate -v ./example/advanced/
 
-```bash
-go run ./cmd/testgen -validate ./example/advanced
-```
-
-Сгенерировать тесты с Minimock:
-
-```bash
-go run ./cmd/testgen --mock=minimock -validate ./example/service
+# Makefile:
+make build     # go build
+make test      # go test ./...
+make validate  # generate + compile check
 ```
 
 ---
 
-## Пример результата
+## Структура проекта
 
-Для функции:
-
-```go
-func Divide(a, b int) (int, error)
 ```
-
-генератор создает table-driven scaffold с несколькими сценариями:
-
-```go
-func TestDivide(t *testing.T) {
-	tests := []struct {
-		name    string
-		inputA  int
-		inputB  int
-		wantErr bool
-	}{
-		{
-			name:    "Divide/success",
-			inputA:  42,
-			inputB:  42,
-			wantErr: false,
-		},
-		{
-			name:    "Divide/error",
-			inputA:  42,
-			inputB:  0,
-			wantErr: true,
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			got0, err := Divide(tt.inputA, tt.inputB)
-
-			if (err != nil) != tt.wantErr {
-				t.Errorf("got err = %v, wantErr %v", err, tt.wantErr)
-			}
-			if tt.wantErr {
-				return
-			}
-
-			_ = got0 // TODO: verify got0 with business-specific expected value
-		})
-	}
-}
+testgen/
+├── Makefile
+├── go.mod
+├── go.sum
+├── README.md
+├── cmd/testgen/main.go             ← CLI точка входа
+├── internal/
+│   ├── model/model.go              ← общие типы данных
+│   ├── loader/loader.go            ← загрузчик: golang.org/x/tools/go/packages
+│   ├── analyzer/analyzer.go        ← go/types + AST → []FunctionSpec + Guards
+│   ├── fixture/fixture.go          ← фикстуры: Happy / Zero / Empty
+│   ├── scenario/scenario.go        ← ScenarioSpec по Guards-фактам
+│   ├── mockplan/mockplan.go        ← MockPlan по полям receiver-структуры
+│   ├── render/render.go            ← text/template + go/format → []byte
+│   ├── validator/validator.go      ← go test -run ^$ .
+│   └── app/app.go                  ← оркестратор пайплайна
+├── templates/test.go.tmpl          ← справочная копия шаблона
+└── example/
+    ├── calculator/calculator.go    ← простые функции (без зависимостей)
+    ├── advanced/advanced.go        ← context.Context, io.Reader, *int, []string
+    └── service/service.go          ← Service + UserRepository (для --mock=minimock)
 ```
-
-Для обычных возвращаемых значений генератор не делает фейковые `expected`-assertions. Вместо этого он оставляет TODO для ручной бизнес-проверки.
 
 ---
 
-## Minimock
+## Флаги CLI
 
-В режиме:
+| Флаг | По умолчанию | Описание |
+|------|-------------|----------|
+| `-o <file>` | автоматически | Путь для записи `*_test.go` |
+| `-validate` | false | Компиляционная проверка через `go test -run ^$ .` |
+| `-v` | false | Подробное логирование |
+| `--mock=MODE` | `none` | Стратегия моков: `none` \| `minimock` |
+| `--fixture=MODE` | `heuristic` | Стратегия фикстур: `heuristic` \| `llm` \| `hybrid` |
+
+---
+
+## Режимы фикстур (`--fixture`)
+
+Фикстура — Go-выражение, которое testgen подставляет как входное значение в тестовый сценарий.
+
+| Режим | Статус | Описание |
+|-------|--------|----------|
+| `heuristic` | ✅ реализован | Детерминированные правила: `42` для int, `"test-value"` для string, `new(T)` для `*T` и т.д. |
+| `llm` | 🔧 не реализован | Генерация осмысленных значений через LLM API. Вернёт ошибку: `llm fixture provider is not implemented` |
+| `hybrid` | 🔧 не реализован | Эвристика + LLM для неизвестных типов. Вернёт ошибку: `hybrid fixture provider is not implemented` |
+
+Архитектура для llm и hybrid **подготовлена**:
+- Интерфейс `fixture.Provider` определён в `internal/fixture/provider.go`
+- Фабрика `fixture.NewProvider(mode)` возвращает нужную реализацию
+- `app.Run` вызывает `NewProvider` как первый шаг (fail-fast)
 
 ```bash
-go run ./cmd/testgen --mock=minimock -validate ./example/service
+# Текущее поведение
+go run ./cmd/testgen --fixture=heuristic -validate ./example/registration  # OK
+
+# Вернёт ошибку: llm fixture provider is not implemented
+go run ./cmd/testgen --fixture=llm ./example/registration
+
+# Вернёт ошибку: hybrid fixture provider is not implemented
+go run ./cmd/testgen --fixture=hybrid ./example/registration
 ```
 
-инструмент:
+---
 
-- находит интерфейсные зависимости receiver-структуры;
-- создает подпапку `mock/`;
-- генерирует mock-файлы через Minimock;
-- генерирует тест во внешнем package `<pkg>_test`;
-- подключает `minimock.Controller`;
-- создает `prepare func(m *testMocks)` для ручной настройки expectations.
+## Что генерируется
 
-Пример структуры:
+Для каждой экспортируемой функции или метода генерируется до трёх сценариев:
 
-```text
-example/service/
-  service.go
-  testgen_generated_test.go
-  mock/
-    user_repository_mock.go
+| Сценарий | Когда | Фикстура |
+|----------|-------|----------|
+| `success` | всегда | happy-значения для всех параметров |
+| `error` | функция возвращает `error` | нулевые значения, `wantErr: true` |
+| `edge_nil_<p>` | Guards: `p == nil` найдено в теле | `nil` для p |
+| `edge_empty_<p>` | Guards: `p == ""` / `len(p) == 0` найдено в теле | `""` / `[]T{}` / `map[K]V{}` |
+
+### Assertion-стратегия
+
+- **error** — проверяется реально: `if (err != nil) != tt.wantErr { t.Errorf(...) }`.
+- **не-error результаты** — placeholder не используется. Вместо `reflect.DeepEqual`
+  генерируется `_ = got0 // TODO: verify got0 with business-specific expected value`.
+  Пользователь сам добавляет нужную проверку.
+
+### Дедупликация edge-сценариев
+
+Сравниваются `Inputs.Expr`, `Wants.Expr`, `WantError`. Если edge полностью
+совпадает с error — пропускается. Ключевой кейс для `[]string` с одним параметром:
+
+| Сценарий | items | Пропуск? |
+|----------|-------|----------|
+| error | `nil` (Zero) | нет |
+| edge_nil | `nil` (Zero) | **да** — дубликат error |
+| edge_empty | `[]string{}` (Empty) | **нет** — уникален |
+
+---
+
+## Фикстуры
+
+| TypeKind | `Happy` | `Zero` |
+|----------|---------|--------|
+| string | `"test-value"` | `""` |
+| int | `42` | `0` |
+| bool | `true` | `false` |
+| `[]T` | `[]T{"test-value"}` | `nil` |
+| `map[K]V` | `map[K]V{}` | `nil` |
+| `*T` | `new(T)` | `nil` |
+| `time.Time` | `time.Now()` | `time.Time{}` |
+| `time.Duration` | `time.Second` | `0` |
+| `context.Context` | `context.Background()` | `nil` |
+| `io.Reader` | `strings.NewReader("test-value")` | `nil` |
+| func | safe stub (zero-returns) | `nil` |
+| interface | `nil` + TODO comment | `nil` |
+
+`new(T)` работает для любого T, включая встроенные: `*int → new(int)`.
+
+---
+
+## Поддержка Minimock
+
+`--mock=minimock` **автоматически генерирует** mock-файлы через `go run` и размещает
+их в поддиректории `mock/` анализируемого пакета:
+
+```
+example/service/mock/user_repository_mock.go   (package mock)
 ```
 
-Пример mock-инфраструктуры:
+### Почему external test package
 
+При `--mock=minimock` тест генерируется в **external test package** (`package service_test`),
+а не в `package service`. Это решает import cycle:
+
+```
+package service       # исходный код
+package service/mock  # моки — импортируют service (для типов UserRepository, User)
+package service_test  # тест — может импортировать и service, и service/mock без цикла
+```
+
+Если бы тест был в `package service`, возник бы цикл:
+```
+service → service/mock → service   ← ОШИБКА
+```
+
+### Что генерируется
+
+**`example/service/mock/user_repository_mock.go`** (package mock, сгенерирован minimock):
 ```go
+package mock
+type UserRepositoryMock struct { ... }
+func NewUserRepositoryMock(t minimock.Tester) *UserRepositoryMock { ... }
+```
+
+**`example/service/testgen_generated_test.go`** (package service_test):
+```go
+package service_test
+
+import (
+    "context"
+    "github.com/gojuno/minimock/v3"
+    mock    "github.com/yourorg/testgen/example/service/mock"
+    service "github.com/yourorg/testgen/example/service"
+    "testing"
+)
+
 type testMocks struct {
-	repo *mock.UserRepositoryMock
+    repo *mock.UserRepositoryMock
 }
 
-mc := minimock.NewController(t)
-
-m := &testMocks{
-	repo: mock.NewUserRepositoryMock(mc),
+func TestService_GetUserName(t *testing.T) {
+    tests := []struct {
+        name      string
+        inputCtx  context.Context
+        inputId   int64
+        wantErr   bool
+        prepare   func(m *testMocks)
+    }{
+        {
+            name: "GetUserName/success",
+            inputCtx: context.Background(),
+            inputId:  42,
+            wantErr:  false,
+            prepare: func(m *testMocks) {
+                // TODO: configure minimock expectations for this scenario
+            },
+        },
+        // ... error и edge сценарии
+    }
+    for _, tt := range tests {
+        t.Run(tt.name, func(t *testing.T) {
+            mc := minimock.NewController(t)
+            m := &testMocks{
+                repo: mock.NewUserRepositoryMock(mc),
+            }
+            if tt.prepare != nil {
+                tt.prepare(m)
+            }
+            rcv := service.NewService(m.repo)   // ← constructor из source пакета
+            got0, err := rcv.GetUserName(tt.inputCtx, tt.inputId)
+            ...
+        })
+    }
 }
-
-rcv := service.NewService(m.repo)
 ```
 
-`Expect(...).Return(...)` в текущей MVP-версии заполняется вручную:
+### Запуск
+
+```bash
+# Одна команда: генерирует моки, scaffold, проверяет компиляцию
+go run ./cmd/testgen --mock=minimock -validate ./example/service
+
+# Затем — заполни prepare-ожидания и запусти тесты
+go test ./example/service/...
+```
+
+### Заполнение prepare
 
 ```go
 prepare: func(m *testMocks) {
-	m.repo.GetByIDMock.
-		Expect(context.Background(), int64(42)).
-		Return(service.User{ID: 42, Name: "Alice"}, nil)
+    m.repo.GetByIDMock.
+        Expect(context.Background(), 42).
+        Return(service.User{ID: 42, Name: "Alice"}, nil)
 },
 ```
 
 ---
 
-## CLI
+## Архитектура (pipeline)
 
-```bash
-go run ./cmd/testgen [flags] <package>
 ```
-
-Флаги:
-
-```text
--validate
-    выполнить compile-only проверку после генерации
-
--v
-    подробный вывод
-
---mock=none|minimock
-    режим работы с моками
-```
-
----
-
-## Архитектура
-
-Основной pipeline:
-
-```text
-loader -> analyzer -> scenario -> fixture -> mockplan/mockgen -> render -> validator
-```
-
-Ключевые пакеты:
-
-```text
-cmd/testgen          CLI-точка входа
-internal/loader      загрузка Go-пакетов
-internal/analyzer    анализ функций, методов и guard-фактов
-internal/scenario    генерация сценариев
-internal/fixture     генерация входных данных
-internal/mockplan    построение плана мокирования
-internal/mockgen     запуск Minimock
-internal/render      генерация _test.go
-internal/validator   проверка компиляции
+Target path
+    │
+    ▼
+loader.Load         golang.org/x/tools/go/packages → AST + TypesInfo
+    │
+    ▼
+analyzer.Analyze    go/types + AST-тело → []FunctionSpec + Guards + ReceiverFields
+    │
+    ▼
+mockplan.Analyze    ReceiverFields → MockPlan (при --mock=minimock)
+    │                 (FieldName, InterfaceName, MockImportPath, MockFilePath, ...)
+    ▼
+mockgen.Generate    go run minimock@v3.4.7 → <pkg>/mock/<name>_mock.go
+    │
+    ▼
+scenario.Generate   Guards → ScenarioSpec (success / error / edge_nil / edge_empty)
+    │
+    ▼
+render.RenderFile   text/template + planImports + go/format → []byte
+    │               (mock.MockType, mock.Constructor, import mock-пакета)
+    ▼
+os.WriteFile        *_test.go
+    │
+    ▼ (если -validate)
+validator.Validate  go test -run ^$ .
 ```
 
 ---
 
 ## Ограничения MVP
 
-- не вычисляет семантически корректные `expected`-значения;
-- не генерирует business assertions автоматически;
-- не заполняет Minimock expectations автоматически;
-- не использует LLM;
-- не использует CFG/SSA;
-- генерирует scaffold, а не полностью готовые бизнес-тесты.
-
----
-
-## Roadmap
-
-Планируемые направления развития:
-
-- LLM fixture provider;
-- автоматическая генерация mock expectations;
-- CFG/SSA-анализ;
-- интеграционные тесты repository-layer;
-- метрики качества генерации: compile rate, pass rate, TODO count, manual edit distance.
-
----
-
-## Назначение проекта
-
-Проект демонстрирует подход к автоматизации рутинной части написания unit-тестов в Go.
-
-Инструмент не заменяет разработчика полностью, а снимает шаблонную работу: анализ сигнатур, подготовку table-driven структуры, генерацию входных данных, подключение моков и проверку компиляции. Разработчик остается ответственным за бизнес-assertions и смысловую корректность тестов.
+- **Interface-параметры** (кроме `context.Context` и `io.Reader`) → `nil` с TODO.
+- **`--mock=minimock`** только готовит инфраструктуру; `.When().Then()` — вручную.
+- **`-validate --mock=minimock`** требует предварительного `go generate` (нужен `*Mock`-тип).
+- **Import planner** использует `strings.Contains` — возможны ложные срабатывания для нестандартных имён.
