@@ -113,15 +113,36 @@ func TestRun_defaultFixtureModeIsHeuristic(t *testing.T) {
 	}
 }
 
-func TestRun_llm_failsFast(t *testing.T) {
-	// llm без dry-run → fail-fast с ErrLLMNotImplemented ДО загрузки пакета.
+func TestRun_llmGenerate_noErrLLMNotImplemented(t *testing.T) {
+	// --fixture=llm без --llm-dry-run теперь пытается вызвать Ollama.
+	// Ollama недоступен в тестовой среде → ошибка "ollama unavailable" или аналогичная.
+	// Главное: НЕ должен возвращать ErrLLMNotImplemented (провайдер уже реализован).
 	cfg := baseConfig(model.FixtureLLM)
 	err := app.Run(cfg)
-	if err == nil {
-		t.Fatal("Run с fixture=llm должен вернуть ошибку")
+	// Может упасть из-за go/packages (нет Go) или из-за недоступного Ollama —
+	// оба варианта приемлемы. Важно что не ErrLLMNotImplemented.
+	if errors.Is(err, fixture.ErrLLMNotImplemented) {
+		t.Errorf("--fixture=llm не должен возвращать ErrLLMNotImplemented (ollama client реализован), got: %v", err)
 	}
-	if !errors.Is(err, fixture.ErrLLMNotImplemented) {
-		t.Errorf("Run(llm): ожидался errors.Is(ErrLLMNotImplemented), got: %v", err)
+}
+
+func TestRun_llm_unsupportedProvider_returnsError(t *testing.T) {
+	// Неподдерживаемый провайдер → немедленная ошибка до загрузки пакета.
+	cfg := app.Config{
+		Target:      "../../example/registration",
+		FixtureMode: model.FixtureLLM,
+		LLMProvider: "openai",
+		Logger:      silentLogger(),
+	}
+	err := app.Run(cfg)
+	if err == nil {
+		t.Fatal("ожидалась ошибка для unsupported provider")
+	}
+	if !strings.Contains(err.Error(), "unsupported llm provider") {
+		t.Errorf("ожидалось 'unsupported llm provider', got: %v", err)
+	}
+	if !strings.Contains(err.Error(), "openai") {
+		t.Errorf("сообщение должно содержать имя провайдера 'openai', got: %v", err)
 	}
 }
 

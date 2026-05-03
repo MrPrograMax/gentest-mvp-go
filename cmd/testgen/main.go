@@ -15,6 +15,7 @@
 //	--fixture=MODE         стратегия фикстур: heuristic|llm|hybrid (по умолчанию heuristic)
 //	--llm-provider=NAME    LLM-бэкенд: ollama (по умолчанию ollama)
 //	--llm-model=NAME       имя модели, например llama3 или mistral
+//	--llm-endpoint=URL     базовый URL LLM API (по умолчанию http://localhost:11434)
 //	--llm-dry-run          вывести JSON-payload для LLM в stdout без реального вызова
 package main
 
@@ -38,6 +39,7 @@ func main() {
 		fixtureMode   = flag.String("fixture", "heuristic", "стратегия фикстур: heuristic|llm|hybrid")
 		llmProvider   = flag.String("llm-provider", "ollama", "LLM-провайдер: ollama")
 		llmModel      = flag.String("llm-model", "", "имя модели LLM, например llama3 или mistral")
+		llmEndpoint   = flag.String("llm-endpoint", "", "базовый URL LLM API (по умолчанию http://localhost:11434)")
 		llmDryRun     = flag.Bool("llm-dry-run", false, "вывести JSON-payload для LLM в stdout без реального вызова")
 	)
 	flag.Usage = func() {
@@ -96,6 +98,7 @@ func main() {
 		FixtureMode:   fMode,
 		LLMProvider:   *llmProvider,
 		LLMModel:      *llmModel,
+		LLMEndpoint:   *llmEndpoint,
 		LLMDryRun:     *llmDryRun,
 		Logger:        logger,
 	}

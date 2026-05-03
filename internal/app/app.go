@@ -12,6 +12,7 @@
 package app
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -21,6 +22,7 @@ import (
 	"github.com/yourorg/testgen/internal/analyzer"
 	"github.com/yourorg/testgen/internal/fixture"
 	"github.com/yourorg/testgen/internal/llm"
+	ollamaclient "github.com/yourorg/testgen/internal/llm/ollama"
 	"github.com/yourorg/testgen/internal/loader"
 	"github.com/yourorg/testgen/internal/mockgen"
 	"github.com/yourorg/testgen/internal/mockplan"
@@ -49,7 +51,8 @@ type Config struct {
 
 	// FixtureMode задаёт стратегию генерации тестовых фикстур.
 	// FixtureHeuristic — детерминированные правила (по умолчанию).
-	// FixtureLLM / FixtureHybrid — не реализованы, вернут ошибку.
+	// FixtureLLM — Ollama HTTP-клиент; ответ выводится в stdout.
+	// FixtureHybrid — не реализован, вернёт ошибку.
 	FixtureMode model.FixtureMode
 
 	// LLMProvider — идентификатор LLM-бэкенда, например "ollama".
@@ -59,6 +62,10 @@ type Config struct {
 	// LLMModel — имя модели внутри провайдера, например "llama3".
 	// Используется только при FixtureMode == FixtureLLM.
 	LLMModel string
+
+	// LLMEndpoint — базовый URL LLM-провайдера.
+	// По умолчанию: http://localhost:11434 (Ollama).
+	LLMEndpoint string
 
 	// LLMDryRun — если true и FixtureMode == FixtureLLM:
 	// вместо реального вызова LLM выводит JSON-payload в stdout и завершается.
@@ -81,18 +88,21 @@ func Run(cfg Config) error {
 		cfg.FixtureMode = model.FixtureHeuristic
 	}
 
-	// Проверяем fixture mode сразу: fail-fast до любой дорогостоящей работы.
-	// Для llm/hybrid возвращаем ошибку "not implemented" — пользователь получит
-	// понятное сообщение, а не упадёт где-то в середине пайплайна.
-	//
-	// Исключение: --fixture=llm --llm-dry-run работает без реального провайдера —
-	// он только строит JSON-payload и выводит в stdout.
-	//
+	// Нормализуем LLMProvider: пустой = "ollama".
+	if cfg.LLMProvider == "" {
+		cfg.LLMProvider = "ollama"
+	}
+	// Валидируем LLMProvider — применяется и к dry-run, и к реальному вызову.
+	// Сейчас поддерживается только "ollama".
+	if cfg.FixtureMode == model.FixtureLLM && cfg.LLMProvider != "ollama" {
+		return fmt.Errorf("unsupported llm provider %q: only ollama is supported", cfg.LLMProvider)
+	}
+
+	// Проверяем fixture mode: fail-fast для неизвестных и hybrid.
+	// llm пропускается — обрабатывается отдельными ветками ниже.
 	// TODO: pass selected fixture.Provider into scenario/fixture planning
-	// when llm/hybrid modes are implemented.
-	// Сейчас NewProvider вызывается только для валидации; heuristic-поведение
-	// обеспечивается пакетными функциями fixture.Happy/Zero/Empty напрямую.
-	if !(cfg.FixtureMode == model.FixtureLLM && cfg.LLMDryRun) {
+	// when hybrid mode is implemented.
+	if cfg.FixtureMode != model.FixtureLLM {
 		if _, err := fixture.NewProvider(cfg.FixtureMode); err != nil {
 			return fmt.Errorf("fixture mode %q: %w", cfg.FixtureMode, err)
 		}
@@ -158,9 +168,16 @@ func Run(cfg Config) error {
 	}
 
 	// 3.5-llm. Dry-run: если --fixture=llm --llm-dry-run, выводим JSON-payload в stdout и выходим.
-	// Реальный HTTP-клиент Ollama не подключён — только инспекция payload.
+	// Dry-run не вызывает Ollama и нужен только для инспекции payload.
 	if cfg.FixtureMode == model.FixtureLLM && cfg.LLMDryRun {
 		return runLLMDryRun(cfg, tests)
+	}
+
+	// 3.6-llm. Реальный вызов Ollama (--fixture=llm без --llm-dry-run).
+	// Строим fixture request, отправляем в Ollama, выводим raw response в stdout.
+	// Встраивание ответа в renderer — следующий этап.
+	if cfg.FixtureMode == model.FixtureLLM {
+		return runLLMGenerate(cfg, tests)
 	}
 
 	// 3.5. Генерируем mock-файлы (только при MockMinimock).
@@ -225,11 +242,10 @@ func Run(cfg Config) error {
 	return nil
 }
 
-// runLLMDryRun выводит JSON-payload для каждого TestSpec в stdout и завершается.
+// runLLMDryRun выводит JSON-payload в stdout и завершается без вызова Ollama.
 //
-// Используется с --fixture=llm --llm-dry-run:
-// позволяет инспектировать, что именно будет отправлено в LLM,
-// до реального HTTP-вызова.
+// Режим инспекции: позволяет увидеть точный запрос, который будет отправлен
+// в модель, не тратя время на реальную генерацию. Удобен для отладки payload.
 func runLLMDryRun(cfg Config, tests []model.TestSpec) error {
 	cfg.Logger.Printf("dry-run: вывод LLM payload в stdout")
 	cfg.Logger.Printf("provider: %s, model: %s", cfg.LLMProvider, cfg.LLMModel)
@@ -242,6 +258,38 @@ func runLLMDryRun(cfg Config, tests []model.TestSpec) error {
 		if err := enc.Encode(req); err != nil {
 			return fmt.Errorf("llm dry-run encode: %w", err)
 		}
+	}
+	return nil
+}
+
+// runLLMGenerate выполняет реальный вызов Ollama для каждого TestSpec.
+//
+// Шаги:
+//  1. Построить llm.Request из FunctionSpec + сценариев.
+//  2. Создать Ollama-клиент (endpoint, model из cfg).
+//  3. Отправить запрос, получить raw response.
+//  4. Вывести raw response в stdout (встраивание в renderer — следующий этап).
+//
+// Ошибки: Ollama недоступен, пустая модель, невалидный ответ.
+func runLLMGenerate(cfg Config, tests []model.TestSpec) error {
+	cfg.Logger.Printf("llm: запуск через %s (model: %s, endpoint: %s)",
+		cfg.LLMProvider, cfg.LLMModel, cfg.LLMEndpoint)
+
+	c := ollamaclient.New(cfg.LLMEndpoint, cfg.LLMModel)
+
+	for _, ts := range tests {
+		req := llm.BuildFixtureRequest(ts.Func, ts.Scenarios)
+
+		cfg.Logger.Printf("llm: запрос фикстур для %s", ts.Func.Name)
+		response, err := c.Generate(context.Background(), req)
+		if err != nil {
+			return fmt.Errorf("llm generate %s: %w", ts.Func.Name, err)
+		}
+
+		// Выводим raw response в stdout.
+		// TODO: следующий этап — парсить JSON и встраивать в renderer.
+		cfg.Logger.Printf("llm: получен ответ для %s (%d bytes)", ts.Func.Name, len(response))
+		fmt.Println(response)
 	}
 	return nil
 }

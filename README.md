@@ -96,6 +96,7 @@ testgen определяет имя выходного файла автомат
 | `--llm-provider=NAME` | `ollama` | LLM-бэкенд (сейчас только `ollama`) |
 | `--llm-model=NAME` | — | Имя модели, например `llama3` или `mistral` |
 | `--llm-dry-run` | false | Вывести JSON-payload для LLM в stdout; не вызывать модель |
+| `--llm-endpoint=URL` | `http://localhost:11434` | Базовый URL LLM API |
 
 ---
 
@@ -106,28 +107,29 @@ testgen определяет имя выходного файла автомат
 | Режим | Статус | Описание |
 |-------|--------|----------|
 | `heuristic` | ✅ реализован | Детерминированные правила: `42` для int, `"test-value"` для string, `new(T)` для `*T` и т.д. |
-| `llm` | 🔧 в разработке | Генерация осмысленных значений через LLM API. Dry-run уже работает. Реальный вызов — not implemented. |
+| `llm` | ✅ клиент готов | Ollama HTTP-клиент реализован. Ответ модели выводится в stdout. JSON→Go литералы — следующий этап. |
 | `hybrid` | 🔧 не реализован | Эвристика + LLM для неизвестных типов. Вернёт ошибку: `hybrid fixture provider is not implemented` |
 
-Архитектура для llm и hybrid **подготовлена**:
+Архитектура llm **полностью подключена**:
 - Интерфейс `fixture.Provider` определён в `internal/fixture/provider.go`
 - Пакет `internal/llm` содержит структуры payload и `BuildFixtureRequest`
-- HTTP-клиент Ollama не подключён — только dry-run
+- `internal/llm/ollama` — HTTP-клиент для Ollama API (`POST /api/generate`)
+- Встраивание ответа в renderer (JSON → Go литералы) — следующий этап
 
 ```bash
-# Текущее поведение
-
-# OK — эвристический провайдер
-go run ./cmd/testgen --fixture=heuristic -validate ./example/registration
-
-# Dry-run: выводит JSON-payload в stdout, не вызывает модель
+# Dry-run: выводит JSON-payload в stdout, Ollama не вызывается
 go run ./cmd/testgen --fixture=llm --llm-dry-run ./example/registration
 
-# С указанием провайдера и модели (dry-run)
-go run ./cmd/testgen --fixture=llm --llm-provider=ollama --llm-model=llama3 --llm-dry-run ./example/registration
+# Реальный вызов Ollama (ответ модели печатается в stdout)
+go run ./cmd/testgen --fixture=llm --llm-provider=ollama --llm-model=qwen2.5-coder ./example/registration
 
-# Ошибка: llm fixture provider is not implemented (без --llm-dry-run)
-go run ./cmd/testgen --fixture=llm ./example/registration
+# С кастомным endpoint
+go run ./cmd/testgen --fixture=llm --llm-provider=ollama --llm-model=llama3 \
+    --llm-endpoint=http://localhost:11434 ./example/registration
+
+# Неподдерживаемый провайдер → ошибка
+# testgen: unsupported llm provider "openai": only ollama is supported
+go run ./cmd/testgen --fixture=llm --llm-provider=openai ./example/registration
 
 # Ошибка: hybrid fixture provider is not implemented
 go run ./cmd/testgen --fixture=hybrid ./example/registration
@@ -137,7 +139,7 @@ go run ./cmd/testgen --fixture=hybrid ./example/registration
 
 ## Что генерируется
 
-Для каждой экспортируемой функции или метода генерируется до трёх сценариев:
+Для каждой экспортируемой функции или метода генерируется набор сценариев:
 
 | Сценарий | Когда | Фикстура |
 |----------|-------|----------|

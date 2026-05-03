@@ -1,13 +1,15 @@
 // Пакет llm содержит инфраструктуру для LLM-провайдера фикстур.
 //
-// На текущем этапе реализован только dry-run:
-// BuildFixtureRequest строит JSON-payload, который будет отправлен в LLM,
-// а реальный HTTP-клиент ещё не подключён.
+// Пакет разделён на два уровня:
+//   - payload.go — структуры Request/Response и BuildFixtureRequest;
+//     используется как для dry-run (вывод в stdout), так и Ollama-клиентом.
+//   - ollama/ — HTTP-клиент для локального Ollama API.
 //
 // Контракт с LLM:
-// Генератор отправляет в LLM описание функции + её сценарии и ожидает назад
-// JSON с конкретными Go-значениями для каждого поля каждого сценария.
-// LLM не пишет Go-код — только JSON. Генератор сам валидирует и конвертирует.
+// Генератор отправляет описание функции + сценариев и ожидает обратно
+// JSON с конкретными значениями для каждого поля каждого сценария.
+// LLM не пишет Go-код — только JSON. Парсинг и встраивание в renderer —
+// следующий этап реализации.
 package llm
 
 import "github.com/yourorg/testgen/internal/model"
@@ -126,15 +128,16 @@ Response format:
   }
 }`
 
-// BuildFixtureRequest строит Request для отправки в LLM.
+// BuildFixtureRequest строит Request для передачи в LLM.
 //
 // Включает:
 //   - описание функции и её параметров (с рекурсивными полями struct)
 //   - field guards (какие проверки делает функция в теле)
 //   - список сценариев с hints для каждого
 //
-// Используется в dry-run режиме (вывод в stdout) и
-// будет использоваться HTTP-клиентом при реальном вызове LLM.
+// Используется в двух режимах:
+//   - dry-run: вывод в stdout для инспекции payload до отправки
+//   - реальный вызов: передаётся в ollama.Client.Generate → BuildPrompt
 func BuildFixtureRequest(fn model.FunctionSpec, scenarios []model.ScenarioSpec) Request {
 	return Request{
 		Function:     buildFunctionPayload(fn),
