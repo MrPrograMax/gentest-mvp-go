@@ -593,3 +593,51 @@ func TestRenderFile_registration_importTime(t *testing.T) {
 		t.Error("сгенерированный файл должен содержать import \"time\"")
 	}
 }
+
+// ── t.Skip scaffold ───────────────────────────────────────────────────────────
+
+func TestRenderFile_minimock_hasSkipScaffold(t *testing.T) {
+	// В minimock-режиме с MockPlan: тест-функция должна начинаться с t.Skip.
+	fn := makeServiceMethod()
+	fs := model.FileSpec{
+		PackageName:       "service",
+		PackageImportPath: "github.com/yourorg/testgen/example/service",
+		Tests:             []model.TestSpec{{Func: fn, Scenarios: scenario.Generate(fn)}},
+		MockMode:          model.MockMinimock,
+	}
+	src, err := render.RenderFile(fs)
+	if err != nil {
+		t.Fatalf("RenderFile: %v\n%s", err, src)
+	}
+	out := string(src)
+	if !strings.Contains(out, `t.Skip("testgen scaffold: configure minimock expectations before enabling this test")`) {
+		t.Errorf("minimock scaffold должен содержать t.Skip, вывод:\n%s", out)
+	}
+}
+
+func TestRenderFile_nonMock_noSkip(t *testing.T) {
+	// Обычная функция без моков не должна содержать t.Skip.
+	fn := model.FunctionSpec{
+		PackageName: "calc",
+		Name:        "Add",
+		Guards:      emptyGuards(),
+		Params: []model.ParamSpec{
+			{Name: "a", TypeStr: "int", Kind: model.KindInt},
+			{Name: "b", TypeStr: "int", Kind: model.KindInt},
+		},
+		Results: []model.ParamSpec{
+			{Name: "result0", TypeStr: "int", Kind: model.KindInt},
+		},
+	}
+	fs := model.FileSpec{
+		PackageName: "calc",
+		Tests:       []model.TestSpec{{Func: fn, Scenarios: scenario.Generate(fn)}},
+	}
+	src, err := render.RenderFile(fs)
+	if err != nil {
+		t.Fatalf("RenderFile: %v\n%s", err, src)
+	}
+	if strings.Contains(string(src), "t.Skip") {
+		t.Error("обычная функция не должна содержать t.Skip")
+	}
+}

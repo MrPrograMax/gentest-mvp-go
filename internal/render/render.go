@@ -110,6 +110,12 @@ type testData struct {
 
 	// HasMocks — true для метода, у которого MockPlan непустой и режим — minimock.
 	HasMocks bool
+
+	// SkipScaffold — true когда HasMocks=true.
+	// Добавляет t.Skip в начало тела тест-функции, чтобы тест не упал
+	// до того, как пользователь настроит minimock expectations и удалит t.Skip.
+	SkipScaffold bool
+
 	// Mocks — конкретные моки для этого теста (используются в t.Run setup).
 	Mocks []testMockField
 }
@@ -197,6 +203,7 @@ func buildTestData(ts model.TestSpec, ctx renderCtx) (testData, error) {
 
 	// Решаем, активен ли minimock-режим для этой функции.
 	td.HasMocks = ctx.mockMode == model.MockMinimock && fn.MockPlan.HasMocks()
+	td.SkipScaffold = td.HasMocks
 	if td.HasMocks {
 		td.Mocks = make([]testMockField, 0, len(fn.MockPlan.Mocks))
 		for _, m := range fn.MockPlan.Mocks {
@@ -595,6 +602,10 @@ type testMocks struct {
 // настрой ожидания минимок-моков, например m.<fieldName>.<Method>Mock.Expect(...).Return(...).
 {{- end}}
 func {{.TestFuncName}}(t *testing.T) {
+{{- if .SkipScaffold}}
+	// TODO: удали t.Skip после того как настроишь minimock expectations в prepare(m *testMocks).
+	t.Skip("testgen scaffold: configure minimock expectations before enabling this test")
+{{- end}}
 	tests := []struct {
 		name string
 {{- range .StructFields}}

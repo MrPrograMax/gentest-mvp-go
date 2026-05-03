@@ -43,6 +43,8 @@ func TestNewService(t *testing.T) {
 // Для каждой строки таблицы реализуй prepare(m *testMocks):
 // настрой ожидания минимок-моков, например m.<fieldName>.<Method>Mock.Expect(...).Return(...).
 func TestService_GetUserName(t *testing.T) {
+	// TODO: удали t.Skip после того как настроишь minimock expectations в prepare(m *testMocks).
+	t.Skip("testgen scaffold: configure minimock expectations before enabling this test")
 	tests := []struct {
 		name     string
 		inputCtx context.Context

@@ -290,11 +290,30 @@ func TestService_GetUserName(t *testing.T) {
 # Одна команда: генерирует моки, scaffold, проверяет компиляцию
 go run ./cmd/testgen --mock=minimock -validate ./example/service
 
-# Затем — заполни prepare-ожидания и запусти тесты
-go test ./example/service/...
+# Сгенерированные тесты по умолчанию пропускаются (t.Skip):
+go test ./example/service/...   # → SKIP (scaffold not configured)
 ```
 
-### Заполнение prepare
+### Почему тесты skipped
+
+Сгенерированный тест содержит `t.Skip` в начале тела функции:
+
+```go
+func TestService_GetUserName(t *testing.T) {
+    // TODO: удали t.Skip после того как настроишь minimock expectations в prepare(m *testMocks).
+    t.Skip("testgen scaffold: configure minimock expectations before enabling this test")
+    ...
+}
+```
+
+Это защита: minimock-тест не может пройти без настроенных expectations — моки будут
+возвращать нулевые значения и тест упадёт с unexpected call. Сначала настрой ожидания,
+затем удали строку `t.Skip`.
+
+### Заполнение prepare и активация теста
+
+1. В сгенерированном файле найди строки `prepare: func(m *testMocks) { // TODO... }`
+2. Настрой expectations:
 
 ```go
 prepare: func(m *testMocks) {
@@ -302,6 +321,13 @@ prepare: func(m *testMocks) {
         Expect(context.Background(), 42).
         Return(service.User{ID: 42, Name: "Alice"}, nil)
 },
+```
+
+3. Удали строку `t.Skip(...)` из начала тест-функции
+4. Запусти тесты:
+
+```bash
+go test ./example/service/...   # → PASS
 ```
 
 ---
