@@ -101,7 +101,7 @@ func TestRun_defaultFixtureModeIsHeuristic(t *testing.T) {
 	// Директория автоматически удаляется по завершении теста.
 	cfg := app.Config{
 		Target:     "../../example/registration",
-		OutputFile: filepath.Join(t.TempDir(), "testgen_generated_test.go"),
+		OutputFile: filepath.Join(t.TempDir(), "registration_test.go"),
 		Logger:     silentLogger(),
 		// FixtureMode намеренно не задан — должен применяться heuristic по умолчанию
 	}

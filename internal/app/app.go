@@ -16,7 +16,6 @@ import (
 	"log"
 	"os"
 	"path/filepath"
-	"strings"
 
 	"github.com/yourorg/testgen/internal/analyzer"
 	"github.com/yourorg/testgen/internal/fixture"
@@ -169,13 +168,17 @@ func Run(cfg Config) error {
 	if err != nil {
 		// render может вернуть (нeформатированный src, error) — сохраняем для диагностики
 		if src != nil {
-			_ = os.WriteFile(outputPath(cfg), src, 0o644)
+			outPath := resolveOutputPath(cfg, pkgName)
+			_ = os.WriteFile(outPath, src, 0o644)
 		}
 		return fmt.Errorf("render: %w", err)
 	}
 
 	// 5. Запись
-	outPath := outputPath(cfg)
+	outPath := resolveOutputPath(cfg, pkgName)
+	if err := checkOverwrite(outPath); err != nil {
+		return err
+	}
 	if err := os.MkdirAll(filepath.Dir(outPath), 0o755); err != nil {
 		return fmt.Errorf("mkdir: %w", err)
 	}
@@ -194,25 +197,4 @@ func Run(cfg Config) error {
 	}
 
 	return nil
-}
-
-// outputPath выводит путь выходного файла из cfg.
-func outputPath(cfg Config) string {
-	if cfg.OutputFile != "" {
-		return cfg.OutputFile
-	}
-
-	info, err := os.Stat(cfg.Target)
-	if err == nil && !info.IsDir() {
-		// Одиночный файл: заменяем .go на _test.go
-		base := strings.TrimSuffix(cfg.Target, ".go")
-		return base + "_test.go"
-	}
-
-	// Директория: кладём сгенерированный файл внутрь.
-	dir := cfg.Target
-	if err != nil {
-		dir = "."
-	}
-	return filepath.Join(dir, "testgen_generated_test.go")
 }
