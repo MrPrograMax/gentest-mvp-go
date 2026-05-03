@@ -114,7 +114,7 @@ func TestRun_defaultFixtureModeIsHeuristic(t *testing.T) {
 }
 
 func TestRun_llm_failsFast(t *testing.T) {
-	// llm возвращает ошибку ДО загрузки пакета.
+	// llm без dry-run → fail-fast с ErrLLMNotImplemented ДО загрузки пакета.
 	cfg := baseConfig(model.FixtureLLM)
 	err := app.Run(cfg)
 	if err == nil {
@@ -122,6 +122,25 @@ func TestRun_llm_failsFast(t *testing.T) {
 	}
 	if !errors.Is(err, fixture.ErrLLMNotImplemented) {
 		t.Errorf("Run(llm): ожидался errors.Is(ErrLLMNotImplemented), got: %v", err)
+	}
+}
+
+func TestRun_llm_dryRun_noFailFast(t *testing.T) {
+	// --fixture=llm --llm-dry-run не должен возвращать ErrLLMNotImplemented.
+	// dry-run обходит fail-fast и выводит JSON-payload; файл не записывается.
+	cfg := app.Config{
+		Target:      "../../example/registration",
+		FixtureMode: model.FixtureLLM,
+		LLMDryRun:   true,
+		LLMProvider: "ollama",
+		LLMModel:    "llama3",
+		Logger:      silentLogger(),
+	}
+	err := app.Run(cfg)
+	// dry-run может упасть из-за go/packages (нет Go в этой среде),
+	// но НЕ должен возвращать ErrLLMNotImplemented.
+	if errors.Is(err, fixture.ErrLLMNotImplemented) {
+		t.Errorf("dry-run не должен возвращать ErrLLMNotImplemented, got: %v", err)
 	}
 }
 

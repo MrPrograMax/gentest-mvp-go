@@ -8,11 +8,14 @@
 //
 // Флаги:
 //
-//	-o string         записать вывод в этот файл (по умолчанию выводится из <путь>)
-//	-validate         скомпилировать вывод через `go test -run ^$ .` после записи
-//	-v                подробное логирование
-//	--mock=MODE       стратегия моков: none|minimock (по умолчанию none)
-//	--fixture=MODE    стратегия фикстур: heuristic|llm|hybrid (по умолчанию heuristic)
+//	-o string              записать вывод в этот файл (по умолчанию выводится из <путь>)
+//	-validate              скомпилировать вывод через `go test -run ^$ .` после записи
+//	-v                     подробное логирование
+//	--mock=MODE            стратегия моков: none|minimock (по умолчанию none)
+//	--fixture=MODE         стратегия фикстур: heuristic|llm|hybrid (по умолчанию heuristic)
+//	--llm-provider=NAME    LLM-бэкенд: ollama (по умолчанию ollama)
+//	--llm-model=NAME       имя модели, например llama3 или mistral
+//	--llm-dry-run          вывести JSON-payload для LLM в stdout без реального вызова
 package main
 
 import (
@@ -33,6 +36,9 @@ func main() {
 		verbose       = flag.Bool("v", false, "подробное логирование")
 		mockMode      = flag.String("mock", "none", "стратегия моков: none|minimock")
 		fixtureMode   = flag.String("fixture", "heuristic", "стратегия фикстур: heuristic|llm|hybrid")
+		llmProvider   = flag.String("llm-provider", "ollama", "LLM-провайдер: ollama")
+		llmModel      = flag.String("llm-model", "", "имя модели LLM, например llama3 или mistral")
+		llmDryRun     = flag.Bool("llm-dry-run", false, "вывести JSON-payload для LLM в stdout без реального вызова")
 	)
 	flag.Usage = func() {
 		fmt.Fprintln(os.Stderr, "Использование: testgen [флаги] <директория-пакета|файл.go>")
@@ -58,7 +64,8 @@ func main() {
 	}
 
 	// Валидируем --fixture.
-	// Неизвестные значения отклоняются здесь; llm/hybrid отклоняются в app.Run.
+	// Неизвестные значения отклоняются здесь; llm/hybrid отклоняются в app.Run
+	// (если не передан --llm-dry-run).
 	var fMode model.FixtureMode
 	switch *fixtureMode {
 	case "heuristic", "":
@@ -87,6 +94,9 @@ func main() {
 		RunValidation: *runValidation,
 		MockMode:      mode,
 		FixtureMode:   fMode,
+		LLMProvider:   *llmProvider,
+		LLMModel:      *llmModel,
+		LLMDryRun:     *llmDryRun,
 		Logger:        logger,
 	}
 

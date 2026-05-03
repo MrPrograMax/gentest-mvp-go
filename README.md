@@ -93,6 +93,9 @@ testgen определяет имя выходного файла автомат
 | `-v` | false | Подробное логирование |
 | `--mock=MODE` | `none` | Стратегия моков: `none` \| `minimock` |
 | `--fixture=MODE` | `heuristic` | Стратегия фикстур: `heuristic` \| `llm` \| `hybrid` |
+| `--llm-provider=NAME` | `ollama` | LLM-бэкенд (сейчас только `ollama`) |
+| `--llm-model=NAME` | — | Имя модели, например `llama3` или `mistral` |
+| `--llm-dry-run` | false | Вывести JSON-payload для LLM в stdout; не вызывать модель |
 
 ---
 
@@ -103,22 +106,30 @@ testgen определяет имя выходного файла автомат
 | Режим | Статус | Описание |
 |-------|--------|----------|
 | `heuristic` | ✅ реализован | Детерминированные правила: `42` для int, `"test-value"` для string, `new(T)` для `*T` и т.д. |
-| `llm` | 🔧 не реализован | Генерация осмысленных значений через LLM API. Вернёт ошибку: `llm fixture provider is not implemented` |
+| `llm` | 🔧 в разработке | Генерация осмысленных значений через LLM API. Dry-run уже работает. Реальный вызов — not implemented. |
 | `hybrid` | 🔧 не реализован | Эвристика + LLM для неизвестных типов. Вернёт ошибку: `hybrid fixture provider is not implemented` |
 
 Архитектура для llm и hybrid **подготовлена**:
 - Интерфейс `fixture.Provider` определён в `internal/fixture/provider.go`
-- Фабрика `fixture.NewProvider(mode)` возвращает нужную реализацию
-- `app.Run` вызывает `NewProvider` как первый шаг (fail-fast)
+- Пакет `internal/llm` содержит структуры payload и `BuildFixtureRequest`
+- HTTP-клиент Ollama не подключён — только dry-run
 
 ```bash
 # Текущее поведение
-go run ./cmd/testgen --fixture=heuristic -validate ./example/registration  # OK
 
-# Вернёт ошибку: llm fixture provider is not implemented
+# OK — эвристический провайдер
+go run ./cmd/testgen --fixture=heuristic -validate ./example/registration
+
+# Dry-run: выводит JSON-payload в stdout, не вызывает модель
+go run ./cmd/testgen --fixture=llm --llm-dry-run ./example/registration
+
+# С указанием провайдера и модели (dry-run)
+go run ./cmd/testgen --fixture=llm --llm-provider=ollama --llm-model=llama3 --llm-dry-run ./example/registration
+
+# Ошибка: llm fixture provider is not implemented (без --llm-dry-run)
 go run ./cmd/testgen --fixture=llm ./example/registration
 
-# Вернёт ошибку: hybrid fixture provider is not implemented
+# Ошибка: hybrid fixture provider is not implemented
 go run ./cmd/testgen --fixture=hybrid ./example/registration
 ```
 

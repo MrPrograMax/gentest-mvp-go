@@ -12,6 +12,7 @@
 package app
 
 import (
+	"encoding/json"
 	"fmt"
 	"log"
 	"os"
@@ -19,6 +20,7 @@ import (
 
 	"github.com/yourorg/testgen/internal/analyzer"
 	"github.com/yourorg/testgen/internal/fixture"
+	"github.com/yourorg/testgen/internal/llm"
 	"github.com/yourorg/testgen/internal/loader"
 	"github.com/yourorg/testgen/internal/mockgen"
 	"github.com/yourorg/testgen/internal/mockplan"
@@ -50,6 +52,19 @@ type Config struct {
 	// FixtureLLM / FixtureHybrid — не реализованы, вернут ошибку.
 	FixtureMode model.FixtureMode
 
+	// LLMProvider — идентификатор LLM-бэкенда, например "ollama".
+	// Используется только при FixtureMode == FixtureLLM.
+	LLMProvider string
+
+	// LLMModel — имя модели внутри провайдера, например "llama3".
+	// Используется только при FixtureMode == FixtureLLM.
+	LLMModel string
+
+	// LLMDryRun — если true и FixtureMode == FixtureLLM:
+	// вместо реального вызова LLM выводит JSON-payload в stdout и завершается.
+	// Позволяет инспектировать запрос до его отправки.
+	LLMDryRun bool
+
 	// Logger — получает сообщения о прогрессе и предупреждения.
 	Logger *log.Logger
 }
@@ -70,12 +85,17 @@ func Run(cfg Config) error {
 	// Для llm/hybrid возвращаем ошибку "not implemented" — пользователь получит
 	// понятное сообщение, а не упадёт где-то в середине пайплайна.
 	//
+	// Исключение: --fixture=llm --llm-dry-run работает без реального провайдера —
+	// он только строит JSON-payload и выводит в stdout.
+	//
 	// TODO: pass selected fixture.Provider into scenario/fixture planning
 	// when llm/hybrid modes are implemented.
 	// Сейчас NewProvider вызывается только для валидации; heuristic-поведение
 	// обеспечивается пакетными функциями fixture.Happy/Zero/Empty напрямую.
-	if _, err := fixture.NewProvider(cfg.FixtureMode); err != nil {
-		return fmt.Errorf("fixture mode %q: %w", cfg.FixtureMode, err)
+	if !(cfg.FixtureMode == model.FixtureLLM && cfg.LLMDryRun) {
+		if _, err := fixture.NewProvider(cfg.FixtureMode); err != nil {
+			return fmt.Errorf("fixture mode %q: %w", cfg.FixtureMode, err)
+		}
 	}
 	cfg.Logger.Printf("fixture mode: %s", cfg.FixtureMode)
 
@@ -137,6 +157,12 @@ func Run(cfg Config) error {
 		pkgName = pkg.Name
 	}
 
+	// 3.5-llm. Dry-run: если --fixture=llm --llm-dry-run, выводим JSON-payload в stdout и выходим.
+	// Реальный HTTP-клиент Ollama не подключён — только инспекция payload.
+	if cfg.FixtureMode == model.FixtureLLM && cfg.LLMDryRun {
+		return runLLMDryRun(cfg, tests)
+	}
+
 	// 3.5. Генерируем mock-файлы (только при MockMinimock).
 	// Запускается ПОСЛЕ построения всех MockPlan, ДО рендеринга тестов.
 	// Моки размещаются в поддиректории mock/ анализируемого пакета.
@@ -196,5 +222,26 @@ func Run(cfg Config) error {
 		cfg.Logger.Printf("компиляция прошла успешно")
 	}
 
+	return nil
+}
+
+// runLLMDryRun выводит JSON-payload для каждого TestSpec в stdout и завершается.
+//
+// Используется с --fixture=llm --llm-dry-run:
+// позволяет инспектировать, что именно будет отправлено в LLM,
+// до реального HTTP-вызова.
+func runLLMDryRun(cfg Config, tests []model.TestSpec) error {
+	cfg.Logger.Printf("dry-run: вывод LLM payload в stdout")
+	cfg.Logger.Printf("provider: %s, model: %s", cfg.LLMProvider, cfg.LLMModel)
+
+	enc := json.NewEncoder(os.Stdout)
+	enc.SetIndent("", "  ")
+
+	for _, ts := range tests {
+		req := llm.BuildFixtureRequest(ts.Func, ts.Scenarios)
+		if err := enc.Encode(req); err != nil {
+			return fmt.Errorf("llm dry-run encode: %w", err)
+		}
+	}
 	return nil
 }
