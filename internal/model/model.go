@@ -21,94 +21,117 @@ const (
 	KindFunc               // func(...) — тип-функция, передаваемый как аргумент
 )
 
+// StructField описывает одно поле структуры для генерации фикстур.
+// Заполняется analyzer через go/types; используется fixture.HappyStructExpr
+// для построения полного composite literal с семантическими значениями.
+type StructField struct {
+	Name      string        // "Email", "Age", "Address"
+	TypeStr   string        // "string", "int", "Address", "time.Time"
+	Kind      TypeKind      // для выбора базовой фикстуры
+	SubFields []StructField // непустой для вложенных KindStruct
+}
+
+// FieldGuardKind описывает вид guard-проверки поля структуры.
+type FieldGuardKind = string
+
+const (
+	// FieldGuardEmpty — поле проверяется на пустую строку: field == ""
+	FieldGuardEmpty FieldGuardKind = "empty"
+	// FieldGuardInvalid — поле проверяется на содержание подстроки: !strings.Contains(field, "@")
+	FieldGuardInvalid FieldGuardKind = "invalid"
+	// FieldGuardLessThan — поле числово меньше порога: field < N
+	FieldGuardLessThan FieldGuardKind = "less_than"
+	// FieldGuardNil — поле проверяется на nil: field == nil
+	FieldGuardNil FieldGuardKind = "nil"
+)
+
+// FieldGuard описывает guard-проверку поля struct-параметра.
+//
+// Примеры:
+//
+//	req.Email == ""                     → Kind=empty,     FieldPath=["Email"]
+//	!strings.Contains(req.Email, "@")   → Kind=invalid,   FieldPath=["Email"], Value="@"
+//	req.Age < 18                        → Kind=less_than, FieldPath=["Age"],   Threshold="18"
+//	req.Address.City == ""              → Kind=empty,     FieldPath=["Address","City"]
+//
+// Используется scenario.fieldGuardScenarios для построения отдельного
+// error-сценария на каждую guard-ветку.
+type FieldGuard struct {
+	ParamName string         // имя параметра: "req"
+	FieldPath []string       // путь к полю: ["Email"] или ["Address","City"]
+	Kind      FieldGuardKind // вид проверки
+
+	// Threshold — пороговое значение для less_than, например "18".
+	Threshold string
+	// Value — ожидаемая подстрока для invalid, например "@".
+	Value string
+}
+
 // ParamSpec описывает один параметр функции или возвращаемое значение.
 type ParamSpec struct {
 	Name    string // идентификатор (генерируется автоматически если анонимный)
 	TypeStr string // короткое представление типа (без пакета для same-pkg типов)
+
 	// TypeStrFull — полностью квалифицированное представление типа через type-checker.
-	// Для типов из того же пакета добавляет квалификатор:
-	// "UserRepository" → "service.UserRepository"
 	// Используется в external test package (_test) чтобы типы были в scope.
-	// Пустая строка означает что type-checker не предоставил информацию.
 	TypeStrFull string
-	Kind        TypeKind // классификация для выбора фикстуры
-	IsError     bool     // true когда тип является встроенным интерфейсом error
+
+	Kind    TypeKind // классификация для выбора фикстуры
+	IsError bool     // true когда тип является встроенным интерфейсом error
+
+	// StructFields — поля структуры для KindStruct-параметров.
+	// Заполняется analyzer через go/types; используется fixture.HappyStructExpr
+	// и scenario.fieldGuardScenarios для генерации осмысленных фикстур.
+	StructFields []StructField
 }
 
 // Guards содержит факты статического анализа тела функции.
-// Используется scenario.Generate для построения осмысленных edge-сценариев:
-// edge создаётся только там, где в реальном коде есть соответствующая проверка.
+// Используется scenario.Generate для построения осмысленных edge-сценариев.
 type Guards struct {
-	// NilCheckedParams — имена параметров, для которых тело функции
-	// содержит явную проверку на nil (x == nil или x != nil).
+	// NilCheckedParams — параметры с явной проверкой x == nil / x != nil.
 	NilCheckedParams map[string]bool
 
-	// EmptyCheckedParams — имена параметров с проверкой на пустоту:
-	// x == "", len(x) == 0 и аналогичные паттерны.
+	// EmptyCheckedParams — параметры с проверкой x == "" / len(x) == 0.
 	EmptyCheckedParams map[string]bool
 
-	// ErrChecked — функция содержит хотя бы одну проверку вида err != nil
-	// для локальной переменной типа error.
+	// ErrChecked — функция содержит проверку err != nil для error-переменной.
 	ErrChecked bool
 
 	// HasPanic — функция содержит вызов panic().
 	HasPanic bool
+
+	// FieldGuards — guards по конкретным полям struct-параметров.
+	// Например: req.Email == "", req.Age < 18, req.Address.City == "".
+	FieldGuards []FieldGuard
 }
 
 // FunctionSpec — внутреннее представление экспортируемой функции или метода.
 type FunctionSpec struct {
 	PackageName       string
 	PackagePath       string // абсолютная директория пакета
-	PackageImportPath string // полный import path, например "github.com/yourorg/testgen/example/service"
+	PackageImportPath string // полный import path
 	Name              string
-	ReceiverName      string // например "s" — пусто для обычных функций
-	ReceiverType      string // например "*Service" — пусто для обычных функций
+	ReceiverName      string
+	ReceiverType      string
 	IsMethod          bool
 	IsVariadic        bool
 	Params            []ParamSpec
 	Results           []ParamSpec
-	HasError          bool   // true когда последний результат имеет тип error
-	Guards            Guards // факты анализа тела функции
+	HasError          bool
+	Guards            Guards
 
-	// ReceiverFields — поля receiver-структуры (только для методов).
-	// Используется mockplan для поиска интерфейс-зависимостей,
-	// которые нужно подменить моками в сгенерированном тесте.
 	ReceiverFields []ReceiverField
-
-	// MockPlan — план мокирования для этой функции.
-	// Заполняется mockplan.Analyze когда MockMode != none.
-	// Пустой план (нет интерфейс-полей) означает что моки не нужны.
-	MockPlan MockPlan
+	MockPlan       MockPlan
 }
 
 // ReceiverField описывает одно поле receiver-структуры.
-// Например для `type Service struct { repo UserRepository }`
-// будет ReceiverField{Name: "repo", TypeStr: "UserRepository", IsInterface: true}.
 type ReceiverField struct {
-	Name        string // имя поля как в исходном коде
-	TypeStr     string // строковое представление типа
-	IsInterface bool   // true если это интерфейс (кандидат на мокирование)
+	Name        string
+	TypeStr     string
+	IsInterface bool
 }
 
 // MockSpec описывает один мок, необходимый для теста метода.
-//
-// Поля идентификации:
-//   - FieldName — имя поля receiver-структуры ("repo")
-//   - InterfaceName — короткое имя интерфейса без пакета ("UserRepository")
-//   - MockType — имя генерируемого типа без пакета ("UserRepositoryMock")
-//   - Constructor — конструктор без пакета ("NewUserRepositoryMock")
-//
-// Поля размещения (вычисляются mockplan, используются mockgen и render):
-//   - SourceInterfacePath — полный путь интерфейса для minimock -i
-//     ("github.com/yourorg/testgen/example/service.UserRepository")
-//   - MockPackage — имя пакета моков ("mock")
-//   - MockImportPath — import path пакета моков
-//     ("github.com/yourorg/testgen/example/service/mock")
-//   - PackageDir — абсолютный путь директории исходного пакета
-//     (используется как cmd.Dir при запуске minimock)
-//   - MockDir — абсолютный путь к директории моков (<PackageDir>/mock)
-//   - MockFileName — имя файла в snake_case ("user_repository_mock.go")
-//   - MockFilePath — абсолютный путь к файлу мока (для os.Stat/проверок)
 type MockSpec struct {
 	FieldName     string
 	InterfaceName string
@@ -125,7 +148,6 @@ type MockSpec struct {
 }
 
 // MockPlan — список моков для одного метода.
-// HasMocks() возвращает true если есть хотя бы один мок-кандидат.
 type MockPlan struct {
 	Mocks []MockSpec
 }
@@ -137,29 +159,17 @@ func (p MockPlan) HasMocks() bool { return len(p.Mocks) > 0 }
 type MockMode string
 
 const (
-	MockNone     MockMode = "none"     // моки не генерируются
-	MockMinimock MockMode = "minimock" // используется gojuno/minimock
+	MockNone     MockMode = "none"
+	MockMinimock MockMode = "minimock"
 )
 
 // FixtureMode задаёт стратегию генерации тестовых фикстур.
-//
-// На данный момент реализован только FixtureHeuristic.
-// FixtureLLM и FixtureHybrid зарезервированы архитектурно —
-// они возвращают ошибку "not implemented" до подключения LLM API.
 type FixtureMode string
 
 const (
-	// FixtureHeuristic — текущая реализация: детерминированные правила
-	// (42 для int, "test-value" для string, new(T) для указателей и т.д.).
 	FixtureHeuristic FixtureMode = "heuristic"
-
-	// FixtureLLM — генерация фикстур через LLM API.
-	// Не реализован: возвращает ошибку "llm fixture provider is not implemented".
-	FixtureLLM FixtureMode = "llm"
-
-	// FixtureHybrid — эвристика + LLM для неизвестных типов.
-	// Не реализован: возвращает ошибку "hybrid fixture provider is not implemented".
-	FixtureHybrid FixtureMode = "hybrid"
+	FixtureLLM       FixtureMode = "llm"
+	FixtureHybrid    FixtureMode = "hybrid"
 )
 
 // ScenarioKind обозначает назначение тестового сценария.
@@ -173,14 +183,11 @@ const (
 
 // FixtureValue — Go-выражение, используемое как тестовая фикстура.
 type FixtureValue struct {
-	Expr    string // Go-литерал или выражение, например "hello", 42, nil
-	TypeStr string // соответствующая строка типа
+	Expr    string
+	TypeStr string
 
-	// NeedsMockComment — если true, render добавит TODO-комментарий в
-	// сгенерированный тест рядом с этим полем. Используется для interface-типов,
-	// где Expr == "nil" является лишь синтаксически корректной заглушкой,
-	// но семантически пользователь обязан подставить реальный mock/stub.
-	// Поле подготовлено для будущей интеграции с mockplan.
+	// NeedsMockComment — render добавит TODO-комментарий для interface-типов,
+	// где Expr == "nil" является синтаксической заглушкой.
 	NeedsMockComment bool
 }
 
@@ -189,8 +196,8 @@ type ScenarioSpec struct {
 	Name      string
 	Kind      ScenarioKind
 	Comment   string
-	Inputs    []FixtureValue // по одному на каждый FunctionSpec.Params
-	Wants     []FixtureValue // по одному на каждый не-error результат
+	Inputs    []FixtureValue
+	Wants     []FixtureValue
 	WantError bool
 }
 
@@ -203,12 +210,8 @@ type TestSpec struct {
 // FileSpec — верхнеуровневый объект для рендеринга *_test.go файла.
 type FileSpec struct {
 	PackageName       string
-	PackageImportPath string // полный import path, например "github.com/yourorg/testgen/example/service"
+	PackageImportPath string
 	SourceDir         string
 	Tests             []TestSpec
-
-	// MockMode определяет, какую minimock-инфраструктуру включит render.
-	// MockNone — никаких моков (поведение по умолчанию для обратной совместимости).
-	// MockMinimock — external test package (_test) + auto import source+mock пакетов.
-	MockMode MockMode
+	MockMode          MockMode
 }

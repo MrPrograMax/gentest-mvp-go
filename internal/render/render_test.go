@@ -482,3 +482,114 @@ func minInt(a, b int) int {
 	}
 	return b
 }
+
+// ── Regression: registration struct scenarios ─────────────────────────────────
+
+func makeRegistrationFuncSpec() model.FunctionSpec {
+	addrFields := []model.StructField{
+		{Name: "City", TypeStr: "string", Kind: model.KindString},
+		{Name: "Street", TypeStr: "string", Kind: model.KindString},
+		{Name: "House", TypeStr: "string", Kind: model.KindString},
+	}
+	reqFields := []model.StructField{
+		{Name: "Email", TypeStr: "string", Kind: model.KindString},
+		{Name: "Name", TypeStr: "string", Kind: model.KindString},
+		{Name: "Age", TypeStr: "int", Kind: model.KindInt},
+		{Name: "Phone", TypeStr: "string", Kind: model.KindString},
+		// TypeStr квалифицирован — как из analyzer. render передаёт PackageName чтобы убрать его.
+		{Name: "Address", TypeStr: "registration.Address", Kind: model.KindStruct, SubFields: addrFields},
+		{Name: "CreatedAt", TypeStr: "time.Time", Kind: model.KindTime},
+	}
+	return model.FunctionSpec{
+		PackageName: "registration",
+		Name:        "ValidateRegisterRequest",
+		HasError:    true,
+		Guards: model.Guards{
+			NilCheckedParams:   map[string]bool{},
+			EmptyCheckedParams: map[string]bool{},
+			FieldGuards: []model.FieldGuard{
+				{ParamName: "req", FieldPath: []string{"Email"}, Kind: model.FieldGuardEmpty},
+				{ParamName: "req", FieldPath: []string{"Email"}, Kind: model.FieldGuardInvalid},
+				{ParamName: "req", FieldPath: []string{"Name"}, Kind: model.FieldGuardEmpty},
+				{ParamName: "req", FieldPath: []string{"Age"}, Kind: model.FieldGuardLessThan, Threshold: "18"},
+				{ParamName: "req", FieldPath: []string{"Address", "City"}, Kind: model.FieldGuardEmpty},
+			},
+		},
+		Params: []model.ParamSpec{
+			{Name: "req", TypeStr: "RegisterRequest", Kind: model.KindStruct, StructFields: reqFields},
+		},
+		Results: []model.ParamSpec{
+			{Name: "err", TypeStr: "error", Kind: model.KindError, IsError: true},
+		},
+	}
+}
+
+func TestRenderFile_registration_sixScenarios(t *testing.T) {
+	fn := makeRegistrationFuncSpec()
+	fs := model.FileSpec{
+		PackageName: "registration",
+		Tests:       []model.TestSpec{{Func: fn, Scenarios: scenario.Generate(fn)}},
+	}
+	src, err := render.RenderFile(fs)
+	if err != nil {
+		t.Fatalf("RenderFile: %v\n%s", err, src)
+	}
+	out := string(src)
+
+	wantScenarios := []string{
+		"ValidateRegisterRequest/success",
+		"ValidateRegisterRequest/error_empty_email",
+		"ValidateRegisterRequest/error_invalid_email",
+		"ValidateRegisterRequest/error_empty_name",
+		"ValidateRegisterRequest/error_underage",
+		"ValidateRegisterRequest/error_empty_city",
+	}
+	for _, name := range wantScenarios {
+		if !strings.Contains(out, name) {
+			t.Errorf("вывод не содержит сценарий %q", name)
+		}
+	}
+}
+
+func TestRenderFile_registration_noEmptyStruct(t *testing.T) {
+	fn := makeRegistrationFuncSpec()
+	fs := model.FileSpec{
+		PackageName: "registration",
+		Tests:       []model.TestSpec{{Func: fn, Scenarios: scenario.Generate(fn)}},
+	}
+	src, err := render.RenderFile(fs)
+	if err != nil {
+		t.Fatalf("RenderFile: %v\n%s", err, src)
+	}
+	out := string(src)
+	// Success-сценарий не должен использовать RegisterRequest{} без полей.
+	if strings.Contains(out, "inputReq: RegisterRequest{}") {
+		t.Error("success сценарий не должен использовать RegisterRequest{}")
+	}
+	if !strings.Contains(out, `"user@example.com"`) {
+		t.Error("success сценарий должен содержать user@example.com")
+	}
+	// Тест в package registration — квалификатор "registration.Address" невалиден.
+	if strings.Contains(out, "registration.Address") {
+		t.Error("same-package тест не должен содержать 'registration.Address'")
+	}
+	if !strings.Contains(out, "Address{") {
+		t.Error("должен содержать 'Address{' (без квалификатора)")
+	}
+}
+
+func TestRenderFile_registration_importTime(t *testing.T) {
+	fn := makeRegistrationFuncSpec()
+	fs := model.FileSpec{
+		PackageName: "registration",
+		Tests:       []model.TestSpec{{Func: fn, Scenarios: scenario.Generate(fn)}},
+	}
+	src, err := render.RenderFile(fs)
+	if err != nil {
+		t.Fatalf("RenderFile: %v\n%s", err, src)
+	}
+	// RegisterRequest содержит time.Now() → import "time" обязателен
+	if !strings.Contains(string(src), `"time"`) {
+		t.Error("сгенерированный файл должен содержать import \"time\"")
+	}
+}

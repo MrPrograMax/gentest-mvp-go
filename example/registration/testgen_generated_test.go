@@ -3,6 +3,7 @@ package registration
 
 import (
 	"testing"
+	"time"
 )
 
 // TestValidateRegisterRequest сгенерирован testgen.
@@ -16,12 +17,32 @@ func TestValidateRegisterRequest(t *testing.T) {
 	}{
 		{
 			name:     "ValidateRegisterRequest/success",
-			inputReq: RegisterRequest{},
+			inputReq: RegisterRequest{Email: "user@example.com", Name: "Test User", Age: 25, Phone: "+79991234567", Address: Address{City: "Moscow", Street: "Tverskaya", House: "1"}, CreatedAt: time.Now()},
 			wantErr:  false,
 		},
 		{
-			name:     "ValidateRegisterRequest/error",
-			inputReq: RegisterRequest{},
+			name:     "ValidateRegisterRequest/error_empty_email",
+			inputReq: RegisterRequest{Email: "", Name: "Test User", Age: 25, Phone: "+79991234567", Address: Address{City: "Moscow", Street: "Tverskaya", House: "1"}, CreatedAt: time.Now()},
+			wantErr:  true,
+		},
+		{
+			name:     "ValidateRegisterRequest/error_invalid_email",
+			inputReq: RegisterRequest{Email: "invalid-email", Name: "Test User", Age: 25, Phone: "+79991234567", Address: Address{City: "Moscow", Street: "Tverskaya", House: "1"}, CreatedAt: time.Now()},
+			wantErr:  true,
+		},
+		{
+			name:     "ValidateRegisterRequest/error_empty_name",
+			inputReq: RegisterRequest{Email: "user@example.com", Name: "", Age: 25, Phone: "+79991234567", Address: Address{City: "Moscow", Street: "Tverskaya", House: "1"}, CreatedAt: time.Now()},
+			wantErr:  true,
+		},
+		{
+			name:     "ValidateRegisterRequest/error_underage",
+			inputReq: RegisterRequest{Email: "user@example.com", Name: "Test User", Age: 17, Phone: "+79991234567", Address: Address{City: "Moscow", Street: "Tverskaya", House: "1"}, CreatedAt: time.Now()},
+			wantErr:  true,
+		},
+		{
+			name:     "ValidateRegisterRequest/error_empty_city",
+			inputReq: RegisterRequest{Email: "user@example.com", Name: "Test User", Age: 25, Phone: "+79991234567", Address: Address{City: "", Street: "Tverskaya", House: "1"}, CreatedAt: time.Now()},
 			wantErr:  true,
 		},
 	}

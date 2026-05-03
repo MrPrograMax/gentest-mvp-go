@@ -1,6 +1,7 @@
 package scenario_test
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/yourorg/testgen/internal/model"
@@ -313,5 +314,140 @@ func TestGenerate_sliceHappyNonEmpty(t *testing.T) {
 	expr := sc[0].Inputs[0].Expr
 	if expr == "nil" || expr == "[]string{}" {
 		t.Errorf("success-фикстура для []string = %q, ожидался непустой срез", expr)
+	}
+}
+
+// ── Regression: fieldGuardScenarios ──────────────────────────────────────────
+
+// makeRegistrationGuards создаёт FunctionSpec для ValidateRegisterRequest
+// с 5 FieldGuards и StructFields (без реального go/types).
+func makeRegistrationGuards() model.FunctionSpec {
+	addrFields := []model.StructField{
+		{Name: "City", TypeStr: "string", Kind: model.KindString},
+		{Name: "Street", TypeStr: "string", Kind: model.KindString},
+		{Name: "House", TypeStr: "string", Kind: model.KindString},
+	}
+	reqFields := []model.StructField{
+		{Name: "Email", TypeStr: "string", Kind: model.KindString},
+		{Name: "Name", TypeStr: "string", Kind: model.KindString},
+		{Name: "Age", TypeStr: "int", Kind: model.KindInt},
+		{Name: "Phone", TypeStr: "string", Kind: model.KindString},
+		// TypeStr квалифицирован — ровно как возвращает analyzer через types.TypeString.
+		// PackageName="registration" должен убрать этот квалификатор в composite literal.
+		{Name: "Address", TypeStr: "registration.Address", Kind: model.KindStruct, SubFields: addrFields},
+		{Name: "CreatedAt", TypeStr: "time.Time", Kind: model.KindTime},
+	}
+	return model.FunctionSpec{
+		PackageName: "registration",
+		Name:        "ValidateRegisterRequest",
+		HasError:    true,
+		Params: []model.ParamSpec{
+			{Name: "req", TypeStr: "RegisterRequest", Kind: model.KindStruct, StructFields: reqFields},
+		},
+		Results: []model.ParamSpec{
+			{Name: "err", TypeStr: "error", Kind: model.KindError, IsError: true},
+		},
+		Guards: model.Guards{
+			NilCheckedParams:   map[string]bool{},
+			EmptyCheckedParams: map[string]bool{},
+			FieldGuards: []model.FieldGuard{
+				{ParamName: "req", FieldPath: []string{"Email"}, Kind: model.FieldGuardEmpty},
+				{ParamName: "req", FieldPath: []string{"Email"}, Kind: model.FieldGuardInvalid},
+				{ParamName: "req", FieldPath: []string{"Name"}, Kind: model.FieldGuardEmpty},
+				{ParamName: "req", FieldPath: []string{"Age"}, Kind: model.FieldGuardLessThan, Threshold: "18"},
+				{ParamName: "req", FieldPath: []string{"Address", "City"}, Kind: model.FieldGuardEmpty},
+			},
+		},
+	}
+}
+
+func TestGenerate_fieldGuards_sixScenarios(t *testing.T) {
+	fn := makeRegistrationGuards()
+	scenarios := scenario.Generate(fn)
+
+	if len(scenarios) != 6 {
+		names := make([]string, len(scenarios))
+		for i, s := range scenarios {
+			names[i] = s.Name
+		}
+		t.Fatalf("ожидалось 6 сценариев, got %d: %v", len(scenarios), names)
+	}
+
+	wantNames := []string{
+		"ValidateRegisterRequest/success",
+		"ValidateRegisterRequest/error_empty_email",
+		"ValidateRegisterRequest/error_invalid_email",
+		"ValidateRegisterRequest/error_empty_name",
+		"ValidateRegisterRequest/error_underage",
+		"ValidateRegisterRequest/error_empty_city",
+	}
+	for i, want := range wantNames {
+		if scenarios[i].Name != want {
+			t.Errorf("scenarios[%d].Name = %q, want %q", i, scenarios[i].Name, want)
+		}
+	}
+}
+
+func TestGenerate_fieldGuards_successUsesHappyStruct(t *testing.T) {
+	fn := makeRegistrationGuards()
+	scenarios := scenario.Generate(fn)
+
+	success := scenarios[0]
+	if success.Name != "ValidateRegisterRequest/success" {
+		t.Fatalf("scenarios[0] не success, got %q", success.Name)
+	}
+	if len(success.Inputs) != 1 {
+		t.Fatalf("inputs count = %d, want 1", len(success.Inputs))
+	}
+	expr := success.Inputs[0].Expr
+	if expr == "RegisterRequest{}" {
+		t.Error("success input не должен быть RegisterRequest{} — нужен happy struct")
+	}
+	if !strings.Contains(expr, `"user@example.com"`) {
+		t.Errorf("success input должен содержать user@example.com, got:\n%s", expr)
+	}
+	// PackageName="registration" → квалификатор "registration.Address" должен быть убран
+	if strings.Contains(expr, "registration.Address") {
+		t.Errorf("success input не должен содержать 'registration.Address' (same-package test):\n%s", expr)
+	}
+	if !strings.Contains(expr, "Address{") {
+		t.Errorf("success input должен содержать 'Address{...}' (без квалификатора):\n%s", expr)
+	}
+}
+
+func TestGenerate_fieldGuards_errorScenariosPatched(t *testing.T) {
+	fn := makeRegistrationGuards()
+	scenarios := scenario.Generate(fn)
+
+	byName := make(map[string]model.ScenarioSpec)
+	for _, s := range scenarios {
+		byName[s.Name] = s
+	}
+
+	// error_empty_email: Email должен быть ""
+	if sc, ok := byName["ValidateRegisterRequest/error_empty_email"]; ok {
+		if !strings.Contains(sc.Inputs[0].Expr, `Email: ""`) {
+			t.Errorf("error_empty_email: want Email:\"\", got:\n%s", sc.Inputs[0].Expr)
+		}
+	} else {
+		t.Error("нет сценария error_empty_email")
+	}
+
+	// error_underage: Age должен быть 17
+	if sc, ok := byName["ValidateRegisterRequest/error_underage"]; ok {
+		if !strings.Contains(sc.Inputs[0].Expr, "Age: 17") {
+			t.Errorf("error_underage: want Age:17, got:\n%s", sc.Inputs[0].Expr)
+		}
+	} else {
+		t.Error("нет сценария error_underage")
+	}
+
+	// error_empty_city: Address.City должен быть ""
+	if sc, ok := byName["ValidateRegisterRequest/error_empty_city"]; ok {
+		if !strings.Contains(sc.Inputs[0].Expr, `City: ""`) {
+			t.Errorf("error_empty_city: want City:\"\", got:\n%s", sc.Inputs[0].Expr)
+		}
+	} else {
+		t.Error("нет сценария error_empty_city")
 	}
 }

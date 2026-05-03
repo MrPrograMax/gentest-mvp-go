@@ -3,25 +3,25 @@
 // Правила генерации:
 //
 //	success — генерируется всегда: happy-фикстуры для всех параметров.
+//	          Для KindStruct-параметров с StructFields строится полный composite literal
+//	          через fixture.HappyStructExpr (с семантическими хэвристиками по имени поля).
 //
-//	error — генерируется если функция возвращает error:
-//	        нулевые фикстуры, wantErr = true.
+//	error (generic) — генерируется если функция возвращает error
+//	          И у параметров нет FieldGuards.
+//	          При наличии FieldGuards заменяется field-specific сценариями.
 //
-//	edge — генерируется только на основе реальных Guards-фактов из тела функции.
-//	       Для каждого параметра возможны два независимых edge:
-//	         edge_nil_<param>   — nil-guard: fixture.Zero (nil для ptr/slice/map/interface)
-//	         edge_empty_<param> — empty-guard: fixture.Empty ([]T{} / "" / map[K]V{})
-//	       Ключевое отличие для []string с единственным параметром:
-//	         error:       inputs=[nil]        (Zero)
-//	         edge_nil:    inputs=[nil]        (Zero) → дублирует error → пропускается
-//	         edge_empty:  inputs=[[]string{}] (Empty) → уникален → сохраняется
+//	error_<kind>_<field> — по одному на каждый FieldGuard:
+//	          берём happy-структуру и «ломаем» ровно одно поле (PatchedStructExpr).
+//
+//	edge — только по Guards-фактам на прямых параметрах (nil/empty guard).
 //
 // Дедупликация честная: сравниваются Inputs.Expr, Wants.Expr, WantError.
-// Только при полном совпадении содержимого кандидат пропускается.
 package scenario
 
 import (
 	"fmt"
+	"strconv"
+	"strings"
 
 	"github.com/yourorg/testgen/internal/fixture"
 	"github.com/yourorg/testgen/internal/model"
@@ -33,7 +33,12 @@ func Generate(fn model.FunctionSpec) []model.ScenarioSpec {
 
 	out = append(out, successScenario(fn))
 
-	if fn.HasError {
+	// Если есть FieldGuards — каждый порождает отдельный error-сценарий.
+	// Они заменяют generic error, который был бы TypeName{} и не нёс бы информации.
+	fieldScenarios := fieldGuardScenarios(fn)
+	if len(fieldScenarios) > 0 {
+		out = append(out, fieldScenarios...)
+	} else if fn.HasError {
 		out = append(out, errorScenario(fn))
 	}
 
@@ -43,12 +48,13 @@ func Generate(fn model.FunctionSpec) []model.ScenarioSpec {
 }
 
 // successScenario: каждый параметр получает happy-фикстуру, ошибки не ожидается.
+// Для KindStruct-параметров с StructFields строим полный composite literal.
 func successScenario(fn model.FunctionSpec) model.ScenarioSpec {
 	return model.ScenarioSpec{
 		Name:      fn.Name + "/success",
 		Kind:      model.ScenarioSuccess,
 		Comment:   "TODO: установи want* в ожидаемые возвращаемые значения",
-		Inputs:    happyInputs(fn.Params),
+		Inputs:    happyInputs(fn.Params, fn.PackageName),
 		Wants:     happyWants(fn.Results),
 		WantError: false,
 	}
@@ -66,18 +72,113 @@ func errorScenario(fn model.FunctionSpec) model.ScenarioSpec {
 	}
 }
 
-// edgeScenarios генерирует edge-сценарии только по Guards-фактам.
+// ── Field-guard сценарии ──────────────────────────────────────────────────────
+
+// fieldGuardScenarios строит по одному error-сценарию на каждый FieldGuard.
 //
-// Для каждого параметра возможны два независимых edge:
-//   - edge_nil_<param>   — nil-guard: fixture.Zero (nil)
-//   - edge_empty_<param> — empty-guard: fixture.Empty ([]T{} / "" / map[K]V{})
-//
-// Каждый кандидат проверяется через isDuplicate против error-сценария
-// и предыдущего добавленного edge. При совпадении содержимого — пропускается.
+// Для каждого guard:
+//  1. Находим параметр по ParamName.
+//  2. Строим «сломанный» composite literal через fixture.PatchedStructExpr:
+//     берём happy-структуру и заменяем одно поле на «плохое» значение.
+//  3. Все остальные параметры получают happy-фикстуру.
+func fieldGuardScenarios(fn model.FunctionSpec) []model.ScenarioSpec {
+	if len(fn.Guards.FieldGuards) == 0 {
+		return nil
+	}
+
+	var out []model.ScenarioSpec
+	for _, guard := range fn.Guards.FieldGuards {
+		// Ищем параметр.
+		paramIdx := -1
+		for i, p := range fn.Params {
+			if p.Name == guard.ParamName {
+				paramIdx = i
+				break
+			}
+		}
+		if paramIdx == -1 {
+			continue
+		}
+
+		patchValue := fieldGuardPatchValue(guard)
+		inputs := make([]model.FixtureValue, len(fn.Params))
+		for i, p := range fn.Params {
+			if i == paramIdx {
+				var expr string
+				if p.Kind == model.KindStruct && len(p.StructFields) > 0 {
+					// fn.PackageName передаётся чтобы убрать квалификатор текущего пакета
+					// у вложенных типов: "registration.Address" → "Address"
+					expr = fixture.PatchedStructExpr(p.TypeStr, p.StructFields, guard.FieldPath, patchValue, fn.PackageName)
+				} else {
+					expr = patchValue
+				}
+				inputs[i] = model.FixtureValue{Expr: expr, TypeStr: p.TypeStr}
+			} else {
+				inputs[i] = fixture.Happy(p.Kind, p.TypeStr)
+			}
+		}
+
+		out = append(out, model.ScenarioSpec{
+			Name:      fieldGuardScenarioName(fn.Name, guard),
+			Kind:      model.ScenarioError,
+			Comment:   "TODO: уточни wantErr — поле " + strings.Join(guard.FieldPath, ".") + " намеренно невалидно",
+			Inputs:    inputs,
+			Wants:     zeroWants(fn.Results),
+			WantError: true,
+		})
+	}
+	return out
+}
+
+// fieldGuardScenarioName формирует имя сценария из имени функции и FieldGuard.
+// Примеры: ValidateRegisterRequest/error_empty_email, .../error_underage
+func fieldGuardScenarioName(fnName string, guard model.FieldGuard) string {
+	leaf := strings.ToLower(guard.FieldPath[len(guard.FieldPath)-1])
+	switch guard.Kind {
+	case model.FieldGuardEmpty:
+		return fnName + "/error_empty_" + leaf
+	case model.FieldGuardInvalid:
+		return fnName + "/error_invalid_" + leaf
+	case model.FieldGuardLessThan:
+		if leaf == "age" {
+			return fnName + "/error_underage"
+		}
+		return fnName + "/error_less_than_" + leaf
+	case model.FieldGuardNil:
+		return fnName + "/error_nil_" + leaf
+	default:
+		return fnName + "/error_" + string(guard.Kind) + "_" + leaf
+	}
+}
+
+// fieldGuardPatchValue возвращает Go-выражение «плохого» значения для FieldGuard.
+func fieldGuardPatchValue(guard model.FieldGuard) string {
+	switch guard.Kind {
+	case model.FieldGuardEmpty:
+		return `""`
+	case model.FieldGuardInvalid:
+		// Строка, намеренно не содержащая guard.Value (например "@")
+		return `"invalid-email"`
+	case model.FieldGuardLessThan:
+		// threshold - 1
+		if t, err := strconv.Atoi(guard.Threshold); err == nil {
+			return strconv.Itoa(t - 1)
+		}
+		return "0"
+	case model.FieldGuardNil:
+		return "nil"
+	default:
+		return `""`
+	}
+}
+
+// ── Edge сценарии (прямые параметры) ─────────────────────────────────────────
+
+// edgeScenarios генерирует edge-сценарии только по Guards-фактам прямых параметров.
+// Field-guard проверки (по полям структур) обрабатываются отдельно в fieldGuardScenarios.
 func edgeScenarios(fn model.FunctionSpec) []model.ScenarioSpec {
 	var out []model.ScenarioSpec
 
-	// Предвычисляем error-сценарий один раз для сравнения при дедупликации.
 	var errSc *model.ScenarioSpec
 	if fn.HasError {
 		s := errorScenario(fn)
@@ -88,13 +189,11 @@ func edgeScenarios(fn model.FunctionSpec) []model.ScenarioSpec {
 		emptyChecked := fn.Guards.EmptyCheckedParams[p.Name]
 		nilChecked := fn.Guards.NilCheckedParams[p.Name]
 
-		// edge_nil: nil-guard → fixture.Zero (nil) для целевого параметра.
-		// Имеет смысл только для типов, которые Go допускает как nil.
 		if nilChecked {
 			switch p.Kind {
 			case model.KindPtr, model.KindInterface, model.KindFunc,
 				model.KindSlice, model.KindMap:
-				target := fixture.Zero(p.Kind, p.TypeStr) // nil
+				target := fixture.Zero(p.Kind, p.TypeStr)
 				sc := buildEdgeScenario(fn, i, p.Name, "nil", target)
 				if !isDuplicate(sc, errSc) && !isDuplicate(sc, lastOf(out)) {
 					out = append(out, sc)
@@ -102,12 +201,10 @@ func edgeScenarios(fn model.FunctionSpec) []model.ScenarioSpec {
 			}
 		}
 
-		// edge_empty: empty-guard → fixture.Empty для целевого параметра.
-		// Для среза/map это []T{} / map[K]V{} — отличается от nil в error-сценарии.
 		if emptyChecked {
 			switch p.Kind {
 			case model.KindString, model.KindSlice, model.KindMap:
-				target := fixture.Empty(p.Kind, p.TypeStr) // "" / []T{} / map[K]V{}
+				target := fixture.Empty(p.Kind, p.TypeStr)
 				sc := buildEdgeScenario(fn, i, p.Name, "empty", target)
 				if !isDuplicate(sc, errSc) && !isDuplicate(sc, lastOf(out)) {
 					out = append(out, sc)
@@ -120,10 +217,6 @@ func edgeScenarios(fn model.FunctionSpec) []model.ScenarioSpec {
 }
 
 // buildEdgeScenario формирует один edge-сценарий.
-//   - targetIdx — индекс параметра, получающего edge-фикстуру
-//   - paramName — имя параметра (для имени сценария и комментария)
-//   - guardKind — "nil" или "empty"
-//   - target    — фикстура для целевого параметра (Zero или Empty)
 func buildEdgeScenario(fn model.FunctionSpec, targetIdx int, paramName, guardKind string, target model.FixtureValue) model.ScenarioSpec {
 	inputs := make([]model.FixtureValue, len(fn.Params))
 	for j, q := range fn.Params {
@@ -151,9 +244,8 @@ func buildEdgeScenario(fn model.FunctionSpec, targetIdx int, paramName, guardKin
 	}
 }
 
-// isDuplicate проверяет, совпадает ли candidate по содержимому с ref.
-// Сравниваются Inputs.Expr, Wants.Expr, WantError — именно то,
-// что определяет строку таблицы в сгенерированном тесте.
+// ── Дедупликация ──────────────────────────────────────────────────────────────
+
 func isDuplicate(candidate model.ScenarioSpec, ref *model.ScenarioSpec) bool {
 	if ref == nil {
 		return false
@@ -165,7 +257,6 @@ func isDuplicate(candidate model.ScenarioSpec, ref *model.ScenarioSpec) bool {
 		fixturesEqual(candidate.Wants, ref.Wants)
 }
 
-// fixturesEqual сравнивает два среза фикстур по полю Expr.
 func fixturesEqual(a, b []model.FixtureValue) bool {
 	if len(a) != len(b) {
 		return false
@@ -178,8 +269,6 @@ func fixturesEqual(a, b []model.FixtureValue) bool {
 	return true
 }
 
-// lastOf возвращает указатель на последний элемент среза, или nil если пуст.
-// Нужен чтобы не добавлять два идентичных edge для одного параметра подряд.
 func lastOf(ss []model.ScenarioSpec) *model.ScenarioSpec {
 	if len(ss) == 0 {
 		return nil
@@ -189,10 +278,20 @@ func lastOf(ss []model.ScenarioSpec) *model.ScenarioSpec {
 
 // ── Вспомогательные функции ───────────────────────────────────────────────────
 
-func happyInputs(params []model.ParamSpec) []model.FixtureValue {
+// happyInputs строит happy-фикстуру для каждого параметра.
+// Для KindStruct с StructFields использует fixture.HappyStructExpr.
+func happyInputs(params []model.ParamSpec, packageName string) []model.FixtureValue {
 	out := make([]model.FixtureValue, len(params))
 	for i, p := range params {
-		out[i] = fixture.Happy(p.Kind, p.TypeStr)
+		if p.Kind == model.KindStruct && len(p.StructFields) > 0 {
+			// Передаём fn.PackageName чтобы strip убрал квалификатор
+			// у вложенных типов из того же пакета:
+			// "registration.Address" → "Address" (тест в package registration)
+			expr := fixture.HappyStructExpr(p.TypeStr, p.StructFields, packageName)
+			out[i] = model.FixtureValue{Expr: expr, TypeStr: p.TypeStr}
+		} else {
+			out[i] = fixture.Happy(p.Kind, p.TypeStr)
+		}
 	}
 	return out
 }
@@ -205,7 +304,6 @@ func zeroInputs(params []model.ParamSpec) []model.FixtureValue {
 	return out
 }
 
-// happyWants — happy-фикстуры для каждого не-error результата.
 func happyWants(results []model.ParamSpec) []model.FixtureValue {
 	var out []model.FixtureValue
 	for _, r := range results {
@@ -217,7 +315,6 @@ func happyWants(results []model.ParamSpec) []model.FixtureValue {
 	return out
 }
 
-// zeroWants — нулевые фикстуры для каждого не-error результата.
 func zeroWants(results []model.ParamSpec) []model.FixtureValue {
 	var out []model.FixtureValue
 	for _, r := range results {

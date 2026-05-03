@@ -152,6 +152,147 @@ func NeedsTimeImport(fvs ...model.FixtureValue) bool {
 	return false
 }
 
+// ── Struct-фикстуры ───────────────────────────────────────────────────────────
+
+// HappyStructField возвращает Go-выражение happy-значения для поля структуры.
+//
+// Приоритет:
+//  1. Семантические хэвристики по имени поля (Email, Name, Phone, City, …)
+//  2. Стандартные значения по TypeKind
+//
+// Цель: success-сценарий должен пройти все validation guards.
+// Например, Email должен содержать "@" и не быть пустым.
+func HappyStructField(fieldName string, kind model.TypeKind, typeStr string) string {
+	switch strings.ToLower(fieldName) {
+	case "email":
+		return `"user@example.com"`
+	case "name", "username", "fullname":
+		return `"Test User"`
+	case "phone", "phonenumber":
+		return `"+79991234567"`
+	case "city":
+		return `"Moscow"`
+	case "street":
+		return `"Tverskaya"`
+	case "house", "housenumber":
+		return `"1"`
+	case "age":
+		return "25"
+	case "password":
+		return `"Passw0rd!"`
+	case "url", "website":
+		return `"https://example.com"`
+	}
+	switch kind {
+	case model.KindString:
+		return `"test-value"`
+	case model.KindInt:
+		return "42"
+	case model.KindBool:
+		return "true"
+	case model.KindTime:
+		return "time.Now()"
+	case model.KindDuration:
+		return "time.Second"
+	case model.KindPtr:
+		inner := strings.TrimPrefix(typeStr, "*")
+		return "new(" + inner + ")"
+	case model.KindSlice:
+		elem := strings.TrimPrefix(typeStr, "[]")
+		return typeStr + "{" + happyElemLit(elem) + "}"
+	case model.KindMap:
+		return typeStr + "{}"
+	case model.KindInterface:
+		if typeStr == "context.Context" {
+			return "context.Background()"
+		}
+		return "nil"
+	default:
+		return typeStr + "{}"
+	}
+}
+
+// HappyStructExpr строит полный Go composite literal для структуры,
+// используя семантические хэвристики для каждого поля.
+// Вложенные структуры обрабатываются рекурсивно.
+//
+// stripPkgs — необязательный список пакетов, чьи квалификаторы нужно убрать
+// из имён вложенных типов. Передаётся когда тест генерируется в том же пакете:
+//
+//	HappyStructExpr("RegisterRequest", fields, "registration")
+//	→ Address{...}  (не registration.Address{...})
+//
+// go/format развернёт однострочную запись в корректное форматирование.
+func HappyStructExpr(typeStr string, fields []model.StructField, stripPkgs ...string) string {
+	if len(fields) == 0 {
+		return stripPkgPrefix(typeStr, stripPkgs) + "{}"
+	}
+	parts := make([]string, 0, len(fields))
+	for _, f := range fields {
+		var val string
+		if f.Kind == model.KindStruct && len(f.SubFields) > 0 {
+			val = HappyStructExpr(f.TypeStr, f.SubFields, stripPkgs...)
+		} else {
+			val = HappyStructField(f.Name, f.Kind, f.TypeStr)
+		}
+		parts = append(parts, f.Name+": "+val)
+	}
+	return stripPkgPrefix(typeStr, stripPkgs) + "{" + strings.Join(parts, ", ") + "}"
+}
+
+// PatchedStructExpr строит composite literal идентичный HappyStructExpr,
+// но с одним полем, подменённым на patchValue.
+//
+// fieldPath задаёт путь к целевому полю:
+//   - ["Email"] — заменяет поле Email на patchValue
+//   - ["Address", "City"] — рекурсивно заменяет City внутри Address
+//
+// stripPkgs — необязательный список пакетов, чьи квалификаторы убираются
+// из имён вложенных типов (см. HappyStructExpr).
+func PatchedStructExpr(typeStr string, fields []model.StructField, fieldPath []string, patchValue string, stripPkgs ...string) string {
+	if len(fields) == 0 || len(fieldPath) == 0 {
+		return stripPkgPrefix(typeStr, stripPkgs) + "{}"
+	}
+	target := fieldPath[0]
+	parts := make([]string, 0, len(fields))
+	for _, f := range fields {
+		var val string
+		if f.Name == target {
+			if len(fieldPath) == 1 {
+				val = patchValue
+			} else if f.Kind == model.KindStruct && len(f.SubFields) > 0 {
+				val = PatchedStructExpr(f.TypeStr, f.SubFields, fieldPath[1:], patchValue, stripPkgs...)
+			} else {
+				val = patchValue
+			}
+		} else {
+			if f.Kind == model.KindStruct && len(f.SubFields) > 0 {
+				val = HappyStructExpr(f.TypeStr, f.SubFields, stripPkgs...)
+			} else {
+				val = HappyStructField(f.Name, f.Kind, f.TypeStr)
+			}
+		}
+		parts = append(parts, f.Name+": "+val)
+	}
+	return stripPkgPrefix(typeStr, stripPkgs) + "{" + strings.Join(parts, ", ") + "}"
+}
+
+// stripPkgPrefix убирает квалификатор "pkg." из начала typeStr для каждого
+// пакета из списка stripPkgs.
+// Вызывается при построении composite literal внутри того же пакета:
+// "registration.Address" + stripPkgs=["registration"] → "Address"
+func stripPkgPrefix(typeStr string, stripPkgs []string) string {
+	for _, pkg := range stripPkgs {
+		if pkg != "" {
+			prefix := pkg + "."
+			if strings.HasPrefix(typeStr, prefix) {
+				return typeStr[len(prefix):]
+			}
+		}
+	}
+	return typeStr
+}
+
 // ── Вспомогательные функции ───────────────────────────────────────────────────
 
 func fv(expr, typeStr string) model.FixtureValue {
@@ -319,3 +460,5 @@ func splitBalanced(s string, sep rune) []string {
 	}
 	return parts
 }
+
+// (end of fixture package)

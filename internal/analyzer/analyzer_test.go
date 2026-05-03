@@ -227,3 +227,138 @@ func MustPositive(n int) int {
 		t.Error("Guards.HasPanic должен быть true")
 	}
 }
+
+// ── Regression: FieldGuards из ValidateRegisterRequest ────────────────────────
+
+func TestAnalyze_fieldGuards_structParam(t *testing.T) {
+	// Минимальная версия ValidateRegisterRequest: 3 field-guard check.
+	src := `package reg
+import (
+	"errors"
+	"strings"
+)
+type Address struct { City string }
+type RegisterRequest struct {
+	Email   string
+	Age     int
+	Address Address
+}
+func ValidateRegisterRequest(req RegisterRequest) error {
+	if req.Email == "" {
+		return errors.New("email required")
+	}
+	if !strings.Contains(req.Email, "@") {
+		return errors.New("invalid email")
+	}
+	if req.Age < 18 {
+		return errors.New("underage")
+	}
+	if req.Address.City == "" {
+		return errors.New("city required")
+	}
+	return nil
+}
+`
+	r := loadDir(t, src)
+	specs, err := analyzer.Analyze(r)
+	if err != nil {
+		t.Fatalf("Analyze: %v", err)
+	}
+	if len(specs) != 1 {
+		t.Fatalf("got %d specs, want 1", len(specs))
+	}
+	fn := specs[0]
+
+	// Должен быть ровно 1 параметр — req RegisterRequest — с Kind=KindStruct и StructFields.
+	if len(fn.Params) != 1 {
+		t.Fatalf("params count = %d, want 1", len(fn.Params))
+	}
+	req := fn.Params[0]
+	if req.Kind != model.KindStruct {
+		t.Errorf("req.Kind = %v, want KindStruct", req.Kind)
+	}
+	if len(req.StructFields) == 0 {
+		t.Error("req.StructFields пустой — analyzer не извлёк поля RegisterRequest")
+	}
+
+	// Проверяем FieldGuards — 4 проверки в теле.
+	guards := fn.Guards.FieldGuards
+	if len(guards) != 4 {
+		t.Fatalf("FieldGuards count = %d, want 4; guards=%+v", len(guards), guards)
+	}
+
+	checkGuard := func(idx int, paramName string, path []string, kind string) {
+		t.Helper()
+		g := guards[idx]
+		if g.ParamName != paramName {
+			t.Errorf("guards[%d].ParamName = %q, want %q", idx, g.ParamName, paramName)
+		}
+		if len(g.FieldPath) != len(path) {
+			t.Errorf("guards[%d].FieldPath = %v, want %v", idx, g.FieldPath, path)
+			return
+		}
+		for i, p := range path {
+			if g.FieldPath[i] != p {
+				t.Errorf("guards[%d].FieldPath[%d] = %q, want %q", idx, i, g.FieldPath[i], p)
+			}
+		}
+		if string(g.Kind) != kind {
+			t.Errorf("guards[%d].Kind = %q, want %q", idx, g.Kind, kind)
+		}
+	}
+
+	checkGuard(0, "req", []string{"Email"}, "empty")
+	checkGuard(1, "req", []string{"Email"}, "invalid")
+	checkGuard(2, "req", []string{"Age"}, "less_than")
+	checkGuard(3, "req", []string{"Address", "City"}, "empty")
+
+	// Threshold для less_than.
+	if guards[2].Threshold != "18" {
+		t.Errorf("guards[2].Threshold = %q, want 18", guards[2].Threshold)
+	}
+}
+
+func TestAnalyze_structFields_populated(t *testing.T) {
+	// Проверяем что StructFields заполняются рекурсивно.
+	src := `package reg
+import "time"
+type Address struct { City string; Street string }
+type Req struct { Email string; Age int; Addr Address; CreatedAt time.Time }
+func Validate(req Req) error { return nil }
+`
+	r := loadDir(t, src)
+	specs, err := analyzer.Analyze(r)
+	if err != nil {
+		t.Fatalf("Analyze: %v", err)
+	}
+	if len(specs) != 1 {
+		t.Fatalf("got %d specs, want 1", len(specs))
+	}
+	fields := specs[0].Params[0].StructFields
+	if len(fields) == 0 {
+		t.Fatal("StructFields пустой")
+	}
+
+	// Ищем поля верхнего уровня
+	byName := make(map[string]model.StructField)
+	for _, f := range fields {
+		byName[f.Name] = f
+	}
+	if _, ok := byName["Email"]; !ok {
+		t.Error("нет поля Email")
+	}
+	if _, ok := byName["Age"]; !ok {
+		t.Error("нет поля Age")
+	}
+	addr, ok := byName["Addr"]
+	if !ok {
+		t.Fatal("нет поля Addr")
+	}
+	if addr.Kind != model.KindStruct {
+		t.Errorf("Addr.Kind = %v, want KindStruct", addr.Kind)
+	}
+	// Рекурсивно должны быть SubFields Address.
+	if len(addr.SubFields) == 0 {
+		t.Error("Addr.SubFields пустой — рекурсивное извлечение не работает")
+	}
+}

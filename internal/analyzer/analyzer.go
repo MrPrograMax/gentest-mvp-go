@@ -81,21 +81,29 @@ func buildSpec(pkg *packages.Package, pkgPath string, fn *ast.FuncDecl) model.Fu
 
 			if len(field.Names) == 0 {
 				// Анонимный параметр.
-				spec.Params = append(spec.Params, model.ParamSpec{
+				ps := model.ParamSpec{
 					Name:        fmt.Sprintf("arg%d", idx),
 					TypeStr:     ts,
 					TypeStrFull: tsFull,
 					Kind:        kind,
-				})
+				}
+				if kind == model.KindStruct {
+					ps.StructFields = extractStructFields(pkg, field.Type)
+				}
+				spec.Params = append(spec.Params, ps)
 				idx++
 			} else {
 				for _, name := range field.Names {
-					spec.Params = append(spec.Params, model.ParamSpec{
+					ps := model.ParamSpec{
 						Name:        name.Name,
 						TypeStr:     ts,
 						TypeStrFull: tsFull,
 						Kind:        kind,
-					})
+					}
+					if kind == model.KindStruct {
+						ps.StructFields = extractStructFields(pkg, field.Type)
+					}
+					spec.Params = append(spec.Params, ps)
 					idx++
 				}
 			}
@@ -174,14 +182,31 @@ func analyzeGuards(fn *ast.FuncDecl, info *types.Info) model.Guards {
 				g.HasPanic = true
 			}
 
+		case *ast.UnaryExpr:
+			// Детектируем !strings.Contains(req.Field, "@") — invalid guard по полю.
+			if node.Op == token.NOT {
+				if call, ok := node.X.(*ast.CallExpr); ok {
+					checkFieldInvalidGuard(call, paramNames, &g)
+				}
+			}
+
 		case *ast.BinaryExpr:
-			if node.Op != token.EQL && node.Op != token.NEQ {
+			if node.Op != token.EQL && node.Op != token.NEQ &&
+				node.Op != token.LSS && node.Op != token.LEQ {
 				return true
 			}
 			checkNilComparison(node, paramNames, info, &g)
 			checkEmptyStringComparison(node, paramNames, &g)
 			checkLenComparison(node, paramNames, &g)
 			checkErrComparison(node, info, &g)
+
+			// Детекция guard-проверок по полям структур.
+			if node.Op == token.EQL || node.Op == token.NEQ {
+				checkFieldEmptyGuard(node, paramNames, &g)
+			}
+			if node.Op == token.LSS || node.Op == token.LEQ {
+				checkFieldLessThanGuard(node, paramNames, &g)
+			}
 		}
 		return true
 	})
@@ -598,4 +623,160 @@ func qualifiedTypeStr(info *types.Info, expr ast.Expr) string {
 		})
 	}
 	return exprStr(expr)
+}
+
+// ── Детекция guard-проверок по полям структур ─────────────────────────────────
+
+// selectorPath извлекает путь к полю из AST-выражения, если корень является параметром.
+// Для req.Email → ["req", "Email"]
+// Для req.Address.City → ["req", "Address", "City"]
+// Возвращает nil, если корень не является параметром.
+func selectorPath(expr ast.Expr, paramNames map[string]bool) []string {
+	switch e := expr.(type) {
+	case *ast.Ident:
+		if paramNames[e.Name] {
+			return []string{e.Name}
+		}
+		return nil
+	case *ast.SelectorExpr:
+		prefix := selectorPath(e.X, paramNames)
+		if prefix == nil {
+			return nil
+		}
+		return append(prefix, e.Sel.Name)
+	default:
+		return nil
+	}
+}
+
+// checkFieldEmptyGuard детектирует req.Field == "" / req.Field.Sub == "".
+// Добавляет FieldGuard{Kind:FieldGuardEmpty} в g.
+func checkFieldEmptyGuard(b *ast.BinaryExpr, paramNames map[string]bool, g *model.Guards) {
+	var candidate ast.Expr
+	if isEmptyStringLit(b.Y) {
+		candidate = b.X
+	} else if isEmptyStringLit(b.X) {
+		candidate = b.Y
+	} else {
+		return
+	}
+
+	path := selectorPath(candidate, paramNames)
+	// path должен быть минимум [paramName, fieldName] (длина >= 2)
+	if len(path) < 2 {
+		return
+	}
+	g.FieldGuards = append(g.FieldGuards, model.FieldGuard{
+		ParamName: path[0],
+		FieldPath: path[1:],
+		Kind:      model.FieldGuardEmpty,
+	})
+}
+
+// checkFieldLessThanGuard детектирует req.Field < N / req.Field <= N.
+// Добавляет FieldGuard{Kind:FieldGuardLessThan, Threshold:N} в g.
+func checkFieldLessThanGuard(b *ast.BinaryExpr, paramNames map[string]bool, g *model.Guards) {
+	// Ожидаем: SelectorExpr < IntLit
+	path := selectorPath(b.X, paramNames)
+	if len(path) < 2 {
+		return
+	}
+	lit, ok := b.Y.(*ast.BasicLit)
+	if !ok || lit.Kind != token.INT {
+		return
+	}
+	g.FieldGuards = append(g.FieldGuards, model.FieldGuard{
+		ParamName: path[0],
+		FieldPath: path[1:],
+		Kind:      model.FieldGuardLessThan,
+		Threshold: lit.Value,
+	})
+}
+
+// checkFieldInvalidGuard детектирует !strings.Contains(req.Field, "@").
+// Добавляет FieldGuard{Kind:FieldGuardInvalid, Value:"@"} в g.
+func checkFieldInvalidGuard(call *ast.CallExpr, paramNames map[string]bool, g *model.Guards) {
+	if !isStringsContainsCall(call) || len(call.Args) != 2 {
+		return
+	}
+	path := selectorPath(call.Args[0], paramNames)
+	if len(path) < 2 {
+		return
+	}
+	// Второй аргумент — строковый литерал (ожидаемая подстрока)
+	lit, ok := call.Args[1].(*ast.BasicLit)
+	if !ok || lit.Kind != token.STRING {
+		return
+	}
+	// Убираем кавычки из литерала
+	val := strings.Trim(lit.Value, `"`)
+	g.FieldGuards = append(g.FieldGuards, model.FieldGuard{
+		ParamName: path[0],
+		FieldPath: path[1:],
+		Kind:      model.FieldGuardInvalid,
+		Value:     val,
+	})
+}
+
+// isStringsContainsCall проверяет, является ли вызов strings.Contains(...)
+func isStringsContainsCall(call *ast.CallExpr) bool {
+	sel, ok := call.Fun.(*ast.SelectorExpr)
+	if !ok {
+		return false
+	}
+	pkg, ok := sel.X.(*ast.Ident)
+	return ok && pkg.Name == "strings" && sel.Sel.Name == "Contains"
+}
+
+// ── Извлечение полей структур ─────────────────────────────────────────────────
+
+// extractStructFields извлекает поля структуры из типа через go/types.
+// Рекурсивно обходит вложенные структуры (кроме time.Time, time.Duration и т.п.).
+// Используется для KindStruct-параметров чтобы fixture мог строить полные composite literal.
+func extractStructFields(pkg *packages.Package, expr ast.Expr) []model.StructField {
+	if pkg == nil || pkg.TypesInfo == nil {
+		return nil
+	}
+	tv, ok := pkg.TypesInfo.Types[expr]
+	if !ok || tv.Type == nil {
+		return nil
+	}
+	return extractFromType(tv.Type)
+}
+
+// extractFromType рекурсивно извлекает StructField из types.Type.
+func extractFromType(t types.Type) []model.StructField {
+	// Снимаем указатель
+	if ptr, ok := t.(*types.Pointer); ok {
+		t = ptr.Elem()
+	}
+	named, ok := t.(*types.Named)
+	if !ok {
+		return nil
+	}
+	// Не раскрываем time.Time / time.Duration — они имеют свои fixture
+	if obj := named.Obj(); obj.Pkg() != nil && obj.Pkg().Path() == "time" {
+		return nil
+	}
+	st, ok := named.Underlying().(*types.Struct)
+	if !ok {
+		return nil
+	}
+
+	out := make([]model.StructField, 0, st.NumFields())
+	for i := 0; i < st.NumFields(); i++ {
+		f := st.Field(i)
+		kind := classifyType(f.Type())
+		sf := model.StructField{
+			Name:    f.Name(),
+			TypeStr: typeStr(f.Type()),
+			Kind:    kind,
+		}
+		// Рекурсия для вложенных структур
+		if kind == model.KindStruct {
+			sf.SubFields = extractFromType(f.Type())
+		}
+		out = append(out, sf)
+	}
+	return out
 }
