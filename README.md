@@ -194,17 +194,18 @@ go run ./cmd/testgen --fixture=hybrid ./example/registration
 `--mock=minimock` **автоматически генерирует** mock-файлы через `go run` и размещает
 их в поддиректории `mock/` анализируемого пакета:
 
-```
+```text
 example/service/mock/user_repository_mock.go   (package mock, сгенерирован minimock)
+```
 
 Файловая структура после:
-```
+
+```text
 example/service/
 ├── service.go
 ├── service_test.go          ← сгенерирован testgen (package service_test)
 └── mock/
     └── user_repository_mock.go   ← package mock
-```
 ```
 
 ### Почему external test package
