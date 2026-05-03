@@ -268,9 +268,10 @@ func runLLMDryRun(cfg Config, tests []model.TestSpec) error {
 //  1. Построить llm.Request из FunctionSpec + сценариев.
 //  2. Создать Ollama-клиент (endpoint, model из cfg).
 //  3. Отправить запрос, получить raw response.
-//  4. Вывести raw response в stdout (встраивание в renderer — следующий этап).
+//  4. Разобрать и валидировать JSON-ответ.
+//  5. Вывести результат в stdout.
 //
-// Ошибки: Ollama недоступен, пустая модель, невалидный ответ.
+// Встраивание validated fixtures в renderer — следующий этап.
 func runLLMGenerate(cfg Config, tests []model.TestSpec) error {
 	cfg.Logger.Printf("llm: запуск через %s (model: %s, endpoint: %s)",
 		cfg.LLMProvider, cfg.LLMModel, cfg.LLMEndpoint)
@@ -281,15 +282,26 @@ func runLLMGenerate(cfg Config, tests []model.TestSpec) error {
 		req := llm.BuildFixtureRequest(ts.Func, ts.Scenarios)
 
 		cfg.Logger.Printf("llm: запрос фикстур для %s", ts.Func.Name)
-		response, err := c.Generate(context.Background(), req)
+		raw, err := c.Generate(context.Background(), req)
 		if err != nil {
 			return fmt.Errorf("llm generate %s: %w", ts.Func.Name, err)
 		}
+		cfg.Logger.Printf("llm: получен ответ для %s (%d bytes)", ts.Func.Name, len(raw))
 
-		// Выводим raw response в stdout.
-		// TODO: следующий этап — парсить JSON и встраивать в renderer.
-		cfg.Logger.Printf("llm: получен ответ для %s (%d bytes)", ts.Func.Name, len(response))
-		fmt.Println(response)
+		// Разбираем JSON-ответ.
+		resp, err := llm.ParseFixtureResponse(raw)
+		if err != nil {
+			return fmt.Errorf("llm %s: %w", ts.Func.Name, err)
+		}
+
+		// Валидируем полноту и типы.
+		if err := llm.ValidateFixtureResponse(resp, req); err != nil {
+			return fmt.Errorf("llm %s: %w", ts.Func.Name, err)
+		}
+
+		// TODO: следующий этап — встраивать validated resp в renderer.
+		fmt.Printf("LLM fixture response is valid for %s (%d scenarios)\n",
+			ts.Func.Name, len(resp.Scenarios))
 	}
 	return nil
 }
