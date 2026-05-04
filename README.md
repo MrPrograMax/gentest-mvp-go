@@ -107,21 +107,34 @@ testgen определяет имя выходного файла автомат
 | Режим | Статус | Описание |
 |-------|--------|----------|
 | `heuristic` | ✅ реализован | Детерминированные правила: `42` для int, `"test-value"` для string, `new(T)` для `*T` и т.д. |
-| `llm` | ✅ клиент готов | Ollama HTTP-клиент реализован. Ответ модели выводится в stdout. JSON→Go литералы — следующий этап. |
+| `llm` | ✅ реализован | Ollama HTTP-клиент + JSON-валидация + JSON→Go литералы. Подставляет LLM-значения в `Inputs` сценариев и далее генерирует тест обычным flow. LLM **не** пишет Go-код — только JSON; Go-литералы строит сам testgen. |
 | `hybrid` | 🔧 не реализован | Эвристика + LLM для неизвестных типов. Вернёт ошибку: `hybrid fixture provider is not implemented` |
 
-Архитектура llm **полностью подключена**:
-- Интерфейс `fixture.Provider` определён в `internal/fixture/provider.go`
-- Пакет `internal/llm` содержит структуры payload и `BuildFixtureRequest`
-- `internal/llm/ollama` — HTTP-клиент для Ollama API (`POST /api/generate`)
-- Встраивание ответа в renderer (JSON → Go литералы) — следующий этап
+### `--fixture=llm` flow
+
+1. testgen строит сценарии (как в heuristic).
+2. Для каждой функции отправляет в Ollama JSON-описание (`function` + `scenarios` + `field_guards`).
+3. Получает JSON-ответ модели и:
+   - `ParseFixtureResponse` — разбирает структуру, снимает markdown-обёртку;
+   - `ValidateFixtureResponse` — проверяет полноту и совпадение типов;
+   - `ApplyFixtureResponseToScenarios` — конвертирует значения в Go-литералы (string → quoted, number → int, bool → `true`/`false`, RFC3339 → `time.Date(...)`, struct → composite literal).
+4. Подставляет полученные литералы в `Inputs` сценариев и запускает обычный render → write → (опц.) compile validate.
+
+При любой ошибке (parse/validate/apply) генерация останавливается с понятной диагностикой — silent fallback на heuristic не делается.
+
+> **Hybrid mode пока не реализован.** Сочетание `--fixture=llm` с `--mock=minimock` на функциях с receiver-моками (external test package) тоже не покрыто на текущем этапе — основной supported путь — same-package тесты (`example/registration`).
 
 ```bash
 # Dry-run: выводит JSON-payload в stdout, Ollama не вызывается
 go run ./cmd/testgen --fixture=llm --llm-dry-run ./example/registration
 
-# Реальный вызов Ollama (ответ модели печатается в stdout)
+# Реальный вызов Ollama: модель возвращает JSON, testgen валидирует,
+# конвертирует в Go-литералы и пишет *_test.go
 go run ./cmd/testgen --fixture=llm --llm-provider=ollama --llm-model=qwen2.5-coder ./example/registration
+
+# С компиляционной валидацией результата
+go run ./cmd/testgen --fixture=llm --llm-provider=ollama --llm-model=qwen2.5-coder \
+    -validate ./example/registration
 
 # С кастомным endpoint
 go run ./cmd/testgen --fixture=llm --llm-provider=ollama --llm-model=llama3 \

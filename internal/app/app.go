@@ -51,8 +51,10 @@ type Config struct {
 
 	// FixtureMode задаёт стратегию генерации тестовых фикстур.
 	// FixtureHeuristic — детерминированные правила (по умолчанию).
-	// FixtureLLM — Ollama HTTP-клиент; ответ выводится в stdout.
-	// FixtureHybrid — не реализован, вернёт ошибку.
+	// FixtureLLM       — Ollama HTTP-клиент: получает JSON, валидирует,
+	//                    конвертирует в Go-литералы и подставляет в Inputs;
+	//                    далее обычный render → write → (опц.) validate.
+	// FixtureHybrid    — не реализован, вернёт ошибку.
 	FixtureMode model.FixtureMode
 
 	// LLMProvider — идентификатор LLM-бэкенда, например "ollama".
@@ -174,10 +176,13 @@ func Run(cfg Config) error {
 	}
 
 	// 3.6-llm. Реальный вызов Ollama (--fixture=llm без --llm-dry-run).
-	// Строим fixture request, отправляем в Ollama, выводим raw response в stdout.
-	// Встраивание ответа в renderer — следующий этап.
+	// runLLMGenerate мутирует tests[i].Scenarios — заменяет Inputs на
+	// LLM-derived Go-литералы. После этого продолжается обычный pipeline:
+	// mockgen → render → write → (опционально) compile validation.
 	if cfg.FixtureMode == model.FixtureLLM {
-		return runLLMGenerate(cfg, tests)
+		if err := runLLMGenerate(cfg, tests); err != nil {
+			return err
+		}
 	}
 
 	// 3.5. Генерируем mock-файлы (только при MockMinimock).
@@ -262,23 +267,37 @@ func runLLMDryRun(cfg Config, tests []model.TestSpec) error {
 	return nil
 }
 
-// runLLMGenerate выполняет реальный вызов Ollama для каждого TestSpec.
+// runLLMGenerate выполняет реальный вызов Ollama для каждого TestSpec и
+// заменяет ts.Scenarios на сценарии с LLM-derived Inputs.
 //
-// Шаги:
+// Шаги для каждого ts:
 //  1. Построить llm.Request из FunctionSpec + сценариев.
-//  2. Создать Ollama-клиент (endpoint, model из cfg).
-//  3. Отправить запрос, получить raw response.
-//  4. Разобрать и валидировать JSON-ответ.
-//  5. Вывести результат в stdout.
+//  2. Отправить запрос в Ollama, получить raw response.
+//  3. ParseFixtureResponse — разобрать JSON.
+//  4. ValidateFixtureResponse — проверить структуру и типы по req.
+//  5. ApplyFixtureResponseToScenarios — построить Go-литералы и подменить Inputs.
 //
-// Встраивание validated fixtures в renderer — следующий этап.
+// Мутирует tests в месте: ts.Scenarios после возврата содержит сценарии
+// с LLM-Inputs. После возврата вызывающий продолжает обычный pipeline
+// (mockgen → render → write → validate).
+//
+// Никакого silent fallback на heuristic нет: первая же ошибка
+// (parse / validate / apply) останавливает генерацию и возвращается наружу.
+//
+// Замечание про package qualifier: ApplyFixtureResponseToScenarios получает
+// ts.Func.PackageName как stripPkg — корректно для same-package тестов
+// (типичный случай --fixture=llm на example/registration). Для сочетания
+// LLM + Minimock + receiver, где renderer переключается на pkg_test, литералы
+// могут оказаться без квалификаторов — эта комбинация на текущем этапе не
+// поддерживается и не покрыта тестами.
 func runLLMGenerate(cfg Config, tests []model.TestSpec) error {
 	cfg.Logger.Printf("llm: запуск через %s (model: %s, endpoint: %s)",
 		cfg.LLMProvider, cfg.LLMModel, cfg.LLMEndpoint)
 
 	c := ollamaclient.New(cfg.LLMEndpoint, cfg.LLMModel)
 
-	for _, ts := range tests {
+	for i := range tests {
+		ts := &tests[i]
 		req := llm.BuildFixtureRequest(ts.Func, ts.Scenarios)
 
 		cfg.Logger.Printf("llm: запрос фикстур для %s", ts.Func.Name)
@@ -299,9 +318,18 @@ func runLLMGenerate(cfg Config, tests []model.TestSpec) error {
 			return fmt.Errorf("llm %s: %w", ts.Func.Name, err)
 		}
 
-		// TODO: следующий этап — встраивать validated resp в renderer.
-		fmt.Printf("LLM fixture response is valid for %s (%d scenarios)\n",
-			ts.Func.Name, len(resp.Scenarios))
+		// Конвертируем JSON-значения в Go-литералы и подменяем Inputs.
+		// PackageName используется для strip "registration.Address" → "Address"
+		// (same-package рендеринг — типичный путь для --fixture=llm).
+		newScenarios, err := llm.ApplyFixtureResponseToScenarios(
+			resp, ts.Func, ts.Scenarios, ts.Func.PackageName)
+		if err != nil {
+			return fmt.Errorf("llm %s: %w", ts.Func.Name, err)
+		}
+		ts.Scenarios = newScenarios
+
+		cfg.Logger.Printf("llm: применено %d сценариев для %s",
+			len(newScenarios), ts.Func.Name)
 	}
 	return nil
 }
